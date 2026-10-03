@@ -1,0 +1,10 @@
+transformer_ltx2.py is vendored from Hugging Face Diffusers
+(https://github.com/huggingface/diffusers, commit 8b33bfc04b6b5e8bb58a58e55f68746c1bbee4cd,
+src/diffusers/models/transformers/transformer_ltx2.py), licensed under the Apache License,
+Version 2.0 (see LICENSE in this directory). Copyright 2025 The Lightricks team and The HuggingFace Team.
+
+It is the reference LTX-2.5 transformer (the diffusers release pinned by vLLM-Omni predates LTX-2.5's
+`ff_bias`, `audio_ff_bias`, `use_prompt_adaln_single` and `use_keyframes_abs_pos_embedding` options).
+It serves as the CPU reference for the Neuron transformer and its tests; it does not run on device.
+
+This commit adds the file unmodified.
