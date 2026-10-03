@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+*.mp4
+*.png
+!docs/**/*.png
+!examples/**/*.png
+neuron_compile_cache/
