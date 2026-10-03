@@ -81,6 +81,7 @@ from vllm_omni_neuron.lite_compat import (
     nki_op,
     register_process_group_replica_groups,
 )
+from vllm_omni_neuron.nc_generation import supports_nki
 
 _VAE_ATTN_D_TILE_SIZE = 128
 _VAE_ATTN_PAD_HEAD_DIM = 512
@@ -390,6 +391,8 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
         pre-sliced to ``[chunk_planes, H, W]``; keyed on shapes + geometry."""
 
         def blend_vertical(above, tile):
+            if blend_height <= 0:  # stride == tile size: abutting tiles, nothing to blend
+                return tile
             weights = (
                 torch.arange(blend_height, device=tile.device, dtype=tile.dtype) / blend_height
             ).reshape(blend_height, 1)
@@ -400,6 +403,8 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
             return torch.cat((blended, tile[..., blend_height:, :]), dim=-2)
 
         def blend_horizontal(left, tile):
+            if blend_width <= 0:
+                return tile
             weights = (
                 torch.arange(blend_width, device=tile.device, dtype=tile.dtype) / blend_width
             ).reshape(1, blend_width)
@@ -1314,7 +1319,12 @@ class WanAttentionBlock(nn.Module):
         qkv = qkv.permute(1, 0, 3, 2).contiguous()
         q, k, v = qkv.unbind(0)
 
-        if x.device.type == "neuron":
+        if x.device.type == "neuron" and not supports_nki():
+            # NeuronCore-v2 (Inf2/Trn1): no NKI; explicit fp32-softmax attention that
+            # torch.compile lowers (single head, one frame's spatial tokens per batch row).
+            scores = torch.matmul(q, k.transpose(-1, -2)).float() * self.scale
+            out = torch.matmul(torch.softmax(scores, dim=-1).to(v.dtype), v)
+        elif x.device.type == "neuron":
             # Keep scale based on the real Wan attention dim C.
             q = (q * self.scale).contiguous()
             k = k.contiguous()
@@ -1944,7 +1954,12 @@ class NeuronWanEncoder3d(nn.Module):
         self.encoder = encoder
         self.quant_conv = quant_conv
 
-    def forward(self, x_chunk, *flat_cache, first_chunk):
+    def forward(self, x_chunk, *flat_cache, first_chunk, patch_size=None):
+        # Wan2.2-TI2V-5B VAE: pixel -> patch layout (a per-frame space-to-depth) as part of the
+        # compiled graph, so the whole encode stays on the NeuronCore. Purely spatial, so doing
+        # it per temporal chunk equals patchifying the whole clip first.
+        if patch_size is not None:
+            x_chunk = patchify(x_chunk, patch_size=patch_size)
         feat_cache = list(flat_cache)
         feat_idx = [0]  # Explicit reset — don't rely on mutable default
         out = self.encoder(
@@ -2023,7 +2038,12 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
         scale_factor_temporal: int | None = 4,
         scale_factor_spatial: int | None = 8,
     ) -> None:
-        super().__init__()
+        # Skip AutoencoderKLWan.__init__: it is itself @register_to_config-decorated, so calling it
+        # with no arguments re-registers its Wan2.1 defaults over this class's config (z_dim 16,
+        # patch_size None, scale_factor_spatial 8, 16-channel latents_mean/std) and builds a
+        # throwaway default-size VAE. Harmless for Wan2.1 checkpoints, wrong for Wan2.2-TI2V-5B
+        # (Cosmos3-Edge): decode would skip unpatchify and de-normalise with the wrong statistics.
+        super(AutoencoderKLWan, self).__init__()
 
         self.z_dim = z_dim
         self.temperal_downsample = temperal_downsample
@@ -2467,17 +2487,24 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
         specializations that share one fixed-shape feat_cache set.
         """
         _, _, num_frame, height, width = x.shape
-
-        if self.config.patch_size is not None:
-            x = patchify(x, patch_size=self.config.patch_size)
+        p = self.config.patch_size
 
         tile_min_height = self.tile_sample_min_height
         tile_min_width = self.tile_sample_min_width
         if self.use_tiling and (width > tile_min_width or height > tile_min_height):
+            if p is not None:
+                x = patchify(x, patch_size=p)
             return self.tiled_encode(x)
 
         encoder = self._encoder_module()
-        feat_map = self._init_enc_feat_cache(x)
+        # Patchify (Wan2.2-TI2V-5B) runs inside the encoder graph, per chunk (see
+        # NeuronWanEncoder3d.forward); the feat_cache is sized for the patchified layout.
+        if p is not None:
+            b, c = x.shape[:2]
+            cache_ref = torch.empty(b, c * p * p, 1, height // p, width // p, device=x.device, dtype=x.dtype)
+        else:
+            cache_ref = x
+        feat_map = self._init_enc_feat_cache(cache_ref)
 
         iter_ = 1 + (num_frame - 1) // 4
         enc_chunks = []
@@ -2487,7 +2514,7 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
             else:
                 idx = torch.arange(1 + 4 * (i - 1), 1 + 4 * i, device=x.device)
             chunk = torch.index_select(x, 2, idx)
-            result = encoder(chunk, *feat_map, first_chunk=(i == 0))
+            result = encoder(chunk, *feat_map, first_chunk=(i == 0), patch_size=p)
             enc_chunks.append(result[0])
             feat_map = list(result[1:])
 
@@ -2760,11 +2787,16 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
         grid_spec: GridSpec,
         tid_coord_map: dict,
     ) -> torch.Tensor:
-        """Gather and blend decoded tiles into a full image on the Neuron device."""
-        if self.config.patch_size is not None:
-            raise NotImplementedError("Device VAE tile merge does not support patchified output")
+        """Gather and blend decoded tiles into a full image on the Neuron device.
+
+        Patchified VAEs (Wan2.2 / Cosmos3-Edge, ``patch_size`` set): tiles are decoded and blended
+        in the patchified layout -- ``tile_split`` already records strides/blends in those units,
+        exactly like diffusers' ``tiled_decode`` -- then the merged frame is unpatchified and
+        clamped once on the output rank.
+        """
+        patch = self.config.patch_size
         ts = grid_spec.tile_spec
-        return self.distributed_executor.gather_and_blend_tiles(
+        merged = self.distributed_executor.gather_and_blend_tiles(
             local_tile_tensor,
             meta_gather,
             grid_spec,
@@ -2775,8 +2807,14 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
             stride_width=ts["tile_sample_stride_width"],
             blend_height=ts["blend_height"],
             blend_width=ts["blend_width"],
-            clamp=True,
+            clamp=patch is None,
         )
+        if patch is None or merged is None:
+            return merged
+        # unpatchify is a view/permute chain the Neuron eager path rejects; the merged frames leave
+        # the device right after this anyway, so do it on the host.
+        merged = merged.to("cpu").contiguous()
+        return torch.clamp(unpatchify(merged, patch_size=patch), min=-1.0, max=1.0)
 
     def tiled_decode(
         self, z: torch.Tensor, return_dict: bool = True

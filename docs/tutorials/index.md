@@ -12,6 +12,13 @@ End-to-end guided walkthroughs for video generation on AWS Trainium.
 End-to-end walkthrough for Wan2.2 A14B video generation on Trainium.
 :::
 
+:::{grid-item-card} Deploy Cosmos3-Edge
+:link: tutorial-cosmos3-edge
+:link-type: doc
+
+All six Cosmos3-Edge modalities on a single Inferentia2 chip, offline and online.
+:::
+
 ::::
 
 :::{toctree}
@@ -19,4 +26,5 @@ End-to-end walkthrough for Wan2.2 A14B video generation on Trainium.
 :hidden:
 
 Deploy Wan2.2-A14B <tutorial-wan22-14b>
+Deploy Cosmos3-Edge <tutorial-cosmos3-edge>
 :::

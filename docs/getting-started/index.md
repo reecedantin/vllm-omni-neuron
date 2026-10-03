@@ -26,6 +26,13 @@ Launch an OpenAI-compatible video server and send your first request.
 Run batch video generation with the offline Omni engine from Python.
 :::
 
+:::{grid-item-card} Cosmos3-Edge offline quickstart (Inferentia2)
+:link: quickstart-offline-serving-cosmos3-edge
+:link-type: doc
+
+Generate an image, a video, or a robot action chunk with Cosmos3-Edge on inf2.
+:::
+
 ::::
 
 :::{toctree}
@@ -35,4 +42,5 @@ Run batch video generation with the offline Omni engine from Python.
 Setup guide <setup-guide>
 Online serving quickstart <quickstart-online-serving-wan22>
 Offline serving quickstart <quickstart-offline-serving-wan22>
+Cosmos3-Edge offline quickstart <quickstart-offline-serving-cosmos3-edge>
 :::
