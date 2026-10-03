@@ -1,7 +1,7 @@
 # vLLM Omni Neuron Plugin (Beta)
 
 The vLLM Omni Neuron plugin is the recommended serving solution for diffusion and
-multimodal generation models on AWS Trainium. It extends
+multimodal generation models on AWS Trainium and Inferentia2. It extends
 [vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) with a Neuron
 backend, providing the same vLLM Omni APIs and configuration you are already
 familiar with.
@@ -15,8 +15,9 @@ validation and performance benchmarking.
 |---|---|---|---|---|---|---|
 | Wan2.2 | T2V-A14B | Text to video | Trn2, Trn3 | ✅ | ✅ | In progress |
 | Wan2.2 | I2V-A14B | Image to video | Trn2, Trn3 | ✅ | ✅ | In progress |
+| Cosmos3 | Edge | Text to image/video, image to video, robot policy, forward/inverse dynamics | Inf2 | ✅ | ✅ | In progress |
 
-- **Correctness** — Accuracy validation passing (VBench and reference comparison)
+- **Correctness** — Accuracy validation passing (VBench, golden tests, and reference comparison)
 - **Perf Test** — Performance benchmark tests tracked across releases
 - **Perf Tuning** — Active optimization work being done
 
@@ -110,6 +111,11 @@ projection, and FP8 MLP. It also calls kernels from the installed NKI Library
 for other attention, output-projection, and BF16 MLP paths. The vendored
 kernels can be read and adapted for other models.
 
+The bundled NKI Library kernels target NeuronCore-v3 and later (Trn2, Trn3).
+On NeuronCore-v2 (Inf2, Trn1), `vllm_omni_neuron/nc_generation.py` routes to the
+PyTorch path or to model-specific NC-v2 kernels, such as Cosmos3-Edge's
+`nki_attention_nc2.py`.
+
 See the [vendored kernel reference](docs/model-dev/kernels/) for what each
 documented kernel computes, its design decisions, and how to adapt it to
 another model.
@@ -141,6 +147,8 @@ Start with:
 - [Offline Wan2.2 quickstart](docs/getting-started/quickstart-offline-serving-wan22.md)
 - [Online Wan2.2 quickstart](docs/getting-started/quickstart-online-serving-wan22.md)
 - [Wan2.2 deployment tutorial](docs/tutorials/tutorial-wan22-14b.md)
+- [Offline Cosmos3-Edge quickstart (Inferentia2)](docs/getting-started/quickstart-offline-serving-cosmos3-edge.md)
+- [Cosmos3-Edge deployment tutorial](docs/tutorials/tutorial-cosmos3-edge.md)
 - [Feature guide](docs/guides/features-guide.md)
 
 ## Version
@@ -151,7 +159,7 @@ The vLLM Omni Neuron plugin version follows the format
 
 | vLLM Omni Neuron Plugin | vLLM Omni Version | Neuron SDK | Instance Support | Status | Documentation |
 |---|---|---|---|---|---|
-| 0.24.0.0.1.0 (latest) | 0.24.0 | 2.32 | Trn2, Trn3 | Beta | [vLLM Omni Neuron docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-omni-neuron/docs/index.html) |
+| 0.24.0.0.1.0 (latest) | 0.24.0 | 2.32 | Trn2, Trn3 (Inf2: Cosmos3-Edge, preview) | Beta | [vLLM Omni Neuron docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-omni-neuron/docs/index.html) |
 
 ## Issues
 
