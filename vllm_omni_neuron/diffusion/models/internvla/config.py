@@ -45,7 +45,9 @@ class TextConfig:
         layer_types = d.get("layer_types")
         if not layer_types:
             every = int(d.get("full_attention_interval", 4))
-            layer_types = ["full_attention" if (i + 1) % every == 0 else "linear_attention" for i in range(n)]
+            layer_types = [
+                "full_attention" if (i + 1) % every == 0 else "linear_attention" for i in range(n)
+            ]
         return cls(
             hidden_size=int(d.get("hidden_size", 2048)),
             intermediate_size=int(d.get("intermediate_size", 6144)),
@@ -62,7 +64,9 @@ class TextConfig:
             linear_num_key_heads=int(d.get("linear_num_key_heads", 16)),
             linear_num_value_heads=int(d.get("linear_num_value_heads", 16)),
             rope_theta=float(rope.get("rope_theta", d.get("rope_theta", 1e7))),
-            partial_rotary_factor=float(rope.get("partial_rotary_factor", d.get("partial_rotary_factor", 0.25))),
+            partial_rotary_factor=float(
+                rope.get("partial_rotary_factor", d.get("partial_rotary_factor", 0.25))
+            ),
             mrope_section=list(rope.get("mrope_section", [11, 11, 10])),
         )
 
@@ -188,13 +192,19 @@ def _checkpoint_vocab(model_path: str, default: int) -> int:
 
     with safe_open(st, "pt") as f:
         for k in f.keys():
-            if k.endswith("qwen3_5.lm_head.weight") or k.endswith("language_model.embed_tokens.weight"):
+            if k.endswith("qwen3_5.lm_head.weight") or k.endswith(
+                "language_model.embed_tokens.weight"
+            ):
                 return int(f.get_slice(k).get_shape()[0])
     return default
 
 
 def resolve_vlm_config(model_path: str, vlm_name: str, explicit: str | None = None) -> str:
-    candidates = [explicit, os.environ.get("INTERNVLA_VLM_CONFIG"), os.path.join(model_path, "vlm", "config.json")]
+    candidates = [
+        explicit,
+        os.environ.get("INTERNVLA_VLM_CONFIG"),
+        os.path.join(model_path, "vlm", "config.json"),
+    ]
     for c in candidates:
         if c and os.path.isdir(c):
             c = os.path.join(c, "config.json")

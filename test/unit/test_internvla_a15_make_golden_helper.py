@@ -33,25 +33,50 @@ def main():
     ap.add_argument("--text-after", type=int, default=90)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dtypes", default="fp32,bf16")
+    ap.add_argument(
+        "--batch",
+        default=None,
+        help="torch.save'd request dict (e.g. a served observation) "
+        "instead of the synthetic request",
+    )
     a = ap.parse_args()
     src = ref_src()
     if src is None:
         raise SystemExit("set INTERNVLA_REF_SRC")
     cfg = InternVLAConfig.from_model_dir(a.model, a.vlm_config)
-    batch = pp.synthetic_request(cfg, n_images=a.n_images, grid=tuple(a.grid), text_before=a.text_before,
-                                 text_after=a.text_after, seed=a.seed)
+    if a.batch:
+        batch = torch.load(a.batch)
+    else:
+        batch = pp.synthetic_request(
+            cfg,
+            n_images=a.n_images,
+            grid=tuple(a.grid),
+            text_before=a.text_before,
+            text_after=a.text_after,
+            seed=a.seed,
+        )
     noise = pp.initial_noise(cfg, seed=a.seed)
     out = {"args": vars(a), "noise": noise}
     for name in a.dtypes.split(","):
         dt = {"fp32": torch.float32, "bf16": torch.bfloat16}[name]
         t0 = time.time()
         model = build_upstream(a.model, a.vlm_config, dt, src)
-        out[f"actions_{name}"] = upstream_sample(model, batch, noise, dt).float()[:, :, : cfg.policy.action_dim]
+        out[f"actions_{name}"] = upstream_sample(model, batch, noise, dt).float()[
+            :, :, : cfg.policy.action_dim
+        ]
         out[f"{name}_s"] = time.time() - t0
         del model
     torch.save(out, a.out)
-    print(json.dumps({k: (round(v, 1) if isinstance(v, float) else v) for k, v in out.items()
-                      if k.endswith("_s")} | {"out": a.out}))
+    print(
+        json.dumps(
+            {
+                k: (round(v, 1) if isinstance(v, float) else v)
+                for k, v in out.items()
+                if k.endswith("_s")
+            }
+            | {"out": a.out}
+        )
+    )
 
 
 if __name__ == "__main__":

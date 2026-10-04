@@ -1,16 +1,16 @@
 # Tutorial: Deploy InternVLA-A1.5 with vLLM Omni Neuron
 
 <!-- meta: description: End-to-end tutorial for serving InternRobotics InternVLA-A1.5 (a vision-language-action
-robot policy) on AWS Inferentia2 / Trainium with the vLLM Omni Neuron plugin: environment, model download,
+robot policy) on AWS Trainium2 with the vLLM Omni Neuron plugin: environment, model download,
 stage configuration, offline and served inference, and troubleshooting. -->
-<!-- meta: keywords: InternVLA, InternVLA-A1.5, tutorial, vLLM Omni, Neuron, inf2, trn2, robot policy, VLA -->
-<!-- meta: date_updated: 2026-10-03 -->
+<!-- meta: keywords: InternVLA, InternVLA-A1.5, tutorial, vLLM Omni, Neuron, trn2, robot policy, VLA -->
+<!-- meta: date_updated: 2026-10-05 -->
 <!-- meta: content_type: tutorial -->
 
 You will serve InternRobotics' InternVLA-A1.5 robot policy on one NeuronCore and get a 50-step action
 chunk from camera views, a robot state and a language instruction — offline first, then through the
-vLLM Omni engine. The whole model is ~5.4 GiB in BF16 (2.68B parameters), so one Inferentia2/Trainium
-core is enough; the first request compiles 3 graphs (minutes on a cold NEFF cache — see
+vLLM Omni engine. The whole model is ~5.4 GiB in BF16 (2.68B parameters), so one trn2 NeuronCore
+is enough (the only hardware measured); the first request compiles the graphs (minutes on a cold NEFF cache — see
 [Performance](../models/internvla-a15.md#performance)).
 
 ## Step 1: Set up your environment
@@ -28,10 +28,12 @@ the Hub at `Qwen/Qwen3.5-2B`). Either let it download automatically, or fetch ju
 
 ```bash
 huggingface-cli download Qwen/Qwen3.5-2B --include "config.json" --local-dir /opt/models/qwen3.5-2b-config
+huggingface-cli download Qwen/Qwen3.5-2B --include "tokenizer*" --local-dir /opt/models/qwen3.5-tokenizer
 ```
 
 Point `--vlm-config /opt/models/qwen3.5-2b-config` (or `$INTERNVLA_VLM_CONFIG`) at it for every command
-below.
+below. Served requests also need the tokenizer: `--tokenizer /opt/models/qwen3.5-tokenizer`,
+`$INTERNVLA_TOKENIZER`, or `model_config.tokenizer` in the stage config.
 
 ## Step 3: Review the stage configuration
 
@@ -87,7 +89,7 @@ the relative error, which should land inside the BF16 rounding band (~0.6%, see 
 
 ```bash
 python examples/internvla/serve.py --model-path /opt/models/internvla-a15-base-served \
-  --vlm-config /opt/models/qwen3.5-2b-config \
+  --vlm-config /opt/models/qwen3.5-2b-config --tokenizer /opt/models/qwen3.5-tokenizer \
   --image-dir /path/to/frames --prompt "pick up the red cube and put it in the bowl" --repeat 5
 ```
 
@@ -96,9 +98,10 @@ The Omni engine always runs its diffusion stage as a multi-process worker, even 
 refuses to start with it present and expects `NEURON_VISIBLE_DEVICES` (set via the stage config's
 `devices:` field) instead.
 
-Expected: engine startup (~20-25 s), then a cold first request (~140 s, compiling the 3 graphs), then
-warm requests around 580 ms each. The script writes the decoded action chunk and a timing summary to
-`--output`.
+Expected: engine startup (~18-20 s), then a first request of ~80 s with a warm NEFF cache (several
+minutes more on a cold one: each prefix bucket compiles its graphs), then warm requests of about 228 ms
+(1 view), 252 ms (2 views) or 267 ms (3 views) on trn2. The script writes the decoded action chunk and a
+timing summary to `--output`.
 
 ## Step 7: Clean up
 

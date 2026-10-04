@@ -34,10 +34,18 @@ COMPILER_ARGS = ["--model-type=transformer", "--auto-cast=none", "-O1"]
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True)
-    ap.add_argument("--vlm-config", default=None, help="Qwen3.5 config.json (default: see config.py)")
+    ap.add_argument(
+        "--vlm-config", default=None, help="Qwen3.5 config.json (default: see config.py)"
+    )
     ap.add_argument("--device", default="neuron", choices=["neuron", "cpu"])
     ap.add_argument("--n-images", type=int, default=3)
-    ap.add_argument("--grid", type=int, nargs=2, default=(16, 16), help="patch grid per image (16x16 = 256x256 px)")
+    ap.add_argument(
+        "--grid",
+        type=int,
+        nargs=2,
+        default=(16, 16),
+        help="patch grid per image (16x16 = 256x256 px)",
+    )
     ap.add_argument("--text-before", type=int, default=14)
     ap.add_argument("--text-after", type=int, default=90)
     ap.add_argument("--bucket", type=int, default=None)
@@ -55,7 +63,9 @@ def rel(a, b):
 
 
 def cos(a, b):
-    return torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
 
 
 def neuron_compile_fn():
@@ -64,8 +74,13 @@ def neuron_compile_fn():
     backend = get_compile_backend_name()
 
     def wrap(mod, name):
-        return torch.compile(mod, backend=backend, fullgraph=True, dynamic=False,
-                             options={"model_name": name, "compiler_args": list(COMPILER_ARGS)})
+        return torch.compile(
+            mod,
+            backend=backend,
+            fullgraph=True,
+            dynamic=False,
+            options={"model_name": name, "compiler_args": list(COMPILER_ARGS)},
+        )
 
     return wrap
 
@@ -73,18 +88,30 @@ def neuron_compile_fn():
 def main() -> int:
     a = parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    summary: dict = {"tag": a.tag, "model": os.path.basename(os.path.normpath(a.model)), "device": a.device}
+    summary: dict = {
+        "tag": a.tag,
+        "model": os.path.basename(os.path.normpath(a.model)),
+        "device": a.device,
+    }
     dev = torch.device("neuron", 0) if a.device == "neuron" else torch.device("cpu")
 
     t0 = time.time()
-    model = InternVLAA15.from_pretrained(a.model, dtype=torch.bfloat16, device=dev, vlm_config=a.vlm_config)
+    model = InternVLAA15.from_pretrained(
+        a.model, dtype=torch.bfloat16, device=dev, vlm_config=a.vlm_config
+    )
     summary["load_s"] = round(time.time() - t0, 1)
     nbytes = sum(p.numel() * p.element_size() for p in model.parameters())
     summary["params_m"] = round(sum(p.numel() for p in model.parameters()) / 1e6, 1)
     summary["weights_gb"] = round(nbytes / 1e9, 2)
     cfg = model.cfg
-    batch = pp.synthetic_request(cfg, n_images=a.n_images, grid=tuple(a.grid), text_before=a.text_before,
-                                 text_after=a.text_after, seed=a.seed)
+    batch = pp.synthetic_request(
+        cfg,
+        n_images=a.n_images,
+        grid=tuple(a.grid),
+        text_before=a.text_before,
+        text_after=a.text_after,
+        seed=a.seed,
+    )
     noise = pp.initial_noise(cfg, seed=a.seed)
     summary["prefix_tokens"] = int(batch["input_ids"].shape[1])
 
@@ -101,9 +128,14 @@ def main() -> int:
     if warm:
         summary["warm_s"] = round(min(warm), 4)
         summary["warm_breakdown"] = {k: round(v, 4) for k, v in runner.timings.items()}
-        summary["deterministic"] = all(torch.equal(o, outs[0]) for o in outs) and torch.equal(outs[0], out)
+        summary["deterministic"] = all(torch.equal(o, outs[0]) for o in outs) and torch.equal(
+            outs[0], out
+        )
     summary["finite"] = bool(torch.isfinite(out).all())
-    torch.save({"actions": out, "noise": noise, "batch": batch}, os.path.join(a.out_dir, f"{a.tag}_actions.pt"))
+    torch.save(
+        {"actions": out, "noise": noise, "batch": batch},
+        os.path.join(a.out_dir, f"{a.tag}_actions.pt"),
+    )
 
     ok = summary["finite"]
     if a.compare_cpu:
@@ -124,13 +156,17 @@ def main() -> int:
         summary["rel_cpu16_vs_cpu32"] = round(rel(ref16, ref32), 5)
         summary["rel_dev_vs_cpu16"] = round(rel(out, ref16), 5)
         if a.device == "neuron":
-            ok = ok and summary["rel_dev_vs_cpu32"] <= max(2.0 * summary["rel_cpu16_vs_cpu32"], 0.02)
+            ok = ok and summary["rel_dev_vs_cpu32"] <= max(
+                2.0 * summary["rel_cpu16_vs_cpu32"], 0.02
+            )
     if a.golden:
         g = torch.load(a.golden)
         summary["rel_dev_vs_upstream32"] = round(rel(out, g["actions_fp32"]), 5)
         summary["cos_dev_vs_upstream32"] = round(cos(out, g["actions_fp32"]), 6)
         if "actions_bf16" in g:
-            summary["rel_upstream16_vs_upstream32"] = round(rel(g["actions_bf16"], g["actions_fp32"]), 5)
+            summary["rel_upstream16_vs_upstream32"] = round(
+                rel(g["actions_bf16"], g["actions_fp32"]), 5
+            )
     summary["ok"] = bool(ok)
     with open(os.path.join(a.out_dir, f"{a.tag}_summary.json"), "w") as f:
         json.dump(summary, f, indent=1)

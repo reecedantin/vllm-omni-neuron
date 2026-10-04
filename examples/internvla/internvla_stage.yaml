@@ -20,6 +20,9 @@ stage_args:
         # Qwen3.5-2B VLM config.json the checkpoint itself doesn't carry; leave unset to use
         # $INTERNVLA_VLM_CONFIG, or <model>/vlm/config.json
         # vlm_config: /path/to/qwen3.5-config/config.json
+        # Qwen3.5 tokenizer directory (tokenizer.json + tokenizer_config.json, e.g. Qwen/Qwen3.5-2B);
+        # leave unset to use $INTERNVLA_TOKENIZER. Requests are refused without one.
+        # tokenizer: /path/to/qwen3.5-tokenizer
         #
         # A bare `model_config:` with no key parses as YAML null, and the engine's own
         # _setup_tensor_capture does `self.od_config.model_config.get(...)` unconditionally ->

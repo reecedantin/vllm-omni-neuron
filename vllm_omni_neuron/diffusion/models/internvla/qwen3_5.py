@@ -185,11 +185,15 @@ def chunk_gated_delta_rule(q, k, v, g, beta, chunk_size: int = 64):
     q = q * (1.0 / math.sqrt(dk))
     v_beta = v * beta.unsqueeze(-1)
     k_beta = k * beta.unsqueeze(-1)
-    q, k, v_beta, k_beta = (t.reshape(b, h, n, chunk_size, t.shape[-1]) for t in (q, k, v_beta, k_beta))
+    q, k, v_beta, k_beta = (
+        t.reshape(b, h, n, chunk_size, t.shape[-1]) for t in (q, k, v_beta, k_beta)
+    )
     g = g.reshape(b, h, n, chunk_size).cumsum(dim=-1)
 
     lower = torch.tril(torch.ones(chunk_size, chunk_size, dtype=q.dtype, device=q.device))
-    strict = torch.tril(torch.ones(chunk_size, chunk_size, dtype=q.dtype, device=q.device), diagonal=-1)
+    strict = torch.tril(
+        torch.ones(chunk_size, chunk_size, dtype=q.dtype, device=q.device), diagonal=-1
+    )
     diff = g.unsqueeze(-1) - g.unsqueeze(-2)
     # Multiplicative float masks, not torch.where(bool_mask, x, 0): the Neuron compiler rejects a
     # broadcast where/select here (NCC_IINAR001 TensorScalarAffineSelect, invalid element count).
@@ -350,15 +354,24 @@ class Qwen35DecoderLayer(nn.Module):
         q, k, v, gate = self.self_attn.project(h, cos, sin)
         if kv_only:
             return None, (k, v)
-        kk, vv = (k, v) if past_kv is None else (torch.cat([past_kv[0], k], 2), torch.cat([past_kv[1], v], 2))
+        kk, vv = (
+            (k, v)
+            if past_kv is None
+            else (torch.cat([past_kv[0], k], 2), torch.cat([past_kv[1], v], 2))
+        )
         attn = eager_attention(q, kk, vv, bias, self.self_attn.scaling)
         x = x + self.self_attn.finish(attn, gate)
         return self.ffn(x), (k, v)
 
 
 class Qwen35TextModel(nn.Module):
-    def __init__(self, cfg: TextConfig, hidden_size: int | None = None, intermediate_size: int | None = None,
-                 with_embeddings: bool = True):
+    def __init__(
+        self,
+        cfg: TextConfig,
+        hidden_size: int | None = None,
+        intermediate_size: int | None = None,
+        with_embeddings: bool = True,
+    ):
         super().__init__()
         hidden_size = hidden_size or cfg.hidden_size
         intermediate_size = intermediate_size or cfg.intermediate_size
@@ -366,7 +379,10 @@ class Qwen35TextModel(nn.Module):
         if with_embeddings:
             self.embed_tokens = nn.Embedding(cfg.vocab_size, hidden_size)
         self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(cfg, i, hidden_size, intermediate_size) for i in range(cfg.num_hidden_layers)]
+            [
+                Qwen35DecoderLayer(cfg, i, hidden_size, intermediate_size)
+                for i in range(cfg.num_hidden_layers)
+            ]
         )
         self.norm = Qwen35RMSNorm(hidden_size, eps=cfg.rms_norm_eps)
 
@@ -395,7 +411,9 @@ class _VisionAttention(nn.Module):
 
     def forward(self, x, cos, sin):  # x [N, P, D] (N equal-size images), cos/sin [P, head_dim] fp32
         n, p, d = x.shape
-        qkv = self.qkv(x).reshape(n, p, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)  # [3,N,H,P,hd]
+        qkv = (
+            self.qkv(x).reshape(n, p, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        )  # [3,N,H,P,hd]
         q, k, v = qkv[0], qkv[1], qkv[2]
         dtype = q.dtype
         c, s = cos[None, None], sin[None, None]

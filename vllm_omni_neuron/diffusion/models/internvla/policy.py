@@ -9,11 +9,17 @@ gated full-attention layers, where suffix queries attend to ``[prefix K/V, suffi
 18 Gated-DeltaNet layers of the expert never see prefix state (upstream overwrites it). So
 the prefix hands the expert exactly 6 (K, V) pairs, and nothing else.
 
-On Neuron that is three fixed-shape graphs, each compiled once per shape bucket:
+On Neuron the prefix and the action expert run as small fixed-shape graphs, each compiled once
+per shape bucket:
 
-* :class:`VisionGraph`   pixels -> merged image tokens (all views batched)
-* :class:`PrefixGraph`   tokens + image tokens -> 6 x (K, V)
-* :class:`DenoiseGraph`  one Euler step ``x_{t+dt} = x_t + dt * v(x_t, t)``
+* :class:`VisionEmbedGraph`   pixels + cached token embeddings -> prefix embeddings
+* :class:`SplitPrefix`        24 prefix layers as 6 fused Gated-DeltaNet runs + 6 full-attention
+  layers -> 6 x (K, V)
+* :class:`DenoiseGraph`       one Euler step ``x_{t+dt} = x_t + dt * v(x_t, t)`` over the 100-token
+  suffix
+
+The CPU reference path keeps upstream's prefix structure (:class:`VisionGraph`, host scatter,
+:class:`PrefixGraph`).
 
 The WAN video branch is training-only and is not built; its projection in the checkpoint is
 skipped. Module names match the checkpoint (``model.`` prefix stripped).
@@ -23,15 +29,17 @@ from __future__ import annotations
 
 import os
 import time
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_omni_neuron.diffusion.layers.block_graphs import BlockGraphRunner
+
 from . import preprocess as pp
 from .config import InternVLAConfig
 from .qwen3_5 import Qwen35DecoderLayer, Qwen35TextModel, Qwen35VisionModel, eager_attention
-from vllm_omni_neuron.diffusion.layers.block_graphs import BlockGraphRunner
 
 _SKIP_PREFIXES = ("learnable_to_wan_proj.", "_wan_grid_sizes", "wan_video_model.")
 _FP32_ALWAYS = ("action_out_proj.",)  # upstream Policy.to() keeps the action head fp32
@@ -56,7 +64,10 @@ class _WithExpert(nn.Module):
         self.qwen3_5 = _Qwen35ForCG(cfg)
         p = cfg.policy
         self.action_expert = Qwen35TextModel(
-            cfg.vlm.text, p.action_expert_hidden_size, p.action_expert_intermediate_size, with_embeddings=False
+            cfg.vlm.text,
+            p.action_expert_hidden_size,
+            p.action_expert_intermediate_size,
+            with_embeddings=False,
         )
 
 
@@ -86,8 +97,13 @@ class InternVLAA15(nn.Module):
 
     # -- weights ----------------------------------------------------------------------------
     @classmethod
-    def from_pretrained(cls, model_path: str, dtype: torch.dtype = torch.bfloat16, device="cpu",
-                        vlm_config: str | None = None) -> InternVLAA15:
+    def from_pretrained(
+        cls,
+        model_path: str,
+        dtype: torch.dtype = torch.bfloat16,
+        device="cpu",
+        vlm_config: str | None = None,
+    ) -> InternVLAA15:
         cfg = InternVLAConfig.from_model_dir(model_path, vlm_config)
         with torch.device("meta"):
             model = cls(cfg)
@@ -113,7 +129,7 @@ class InternVLAA15(nn.Module):
         state, skipped = {}, []
         with safe_open(path, "pt") as f:
             for key in f.keys():
-                name = key[len("model."):] if key.startswith("model.") else key
+                name = key[len("model.") :] if key.startswith("model.") else key
                 if name.startswith(_SKIP_PREFIXES):
                     skipped.append(name)
                     continue
@@ -126,13 +142,20 @@ class InternVLAA15(nn.Module):
                 if tuple(t.shape) != tuple(want):
                     raise ValueError(f"{key}: checkpoint {tuple(t.shape)} vs model {tuple(want)}")
                 td = torch.float32 if name.startswith(_FP32_ALWAYS) else dtype
-                state[name] = nn.Parameter(t.to(td).to(device), requires_grad=False)  # cast on host first
+                state[name] = nn.Parameter(
+                    t.to(td).to(device), requires_grad=False
+                )  # cast on host first
         missing = sorted(set(expected) - set(state))
         if missing:
             raise KeyError(f"checkpoint is missing {len(missing)} tensors, e.g. {missing[:5]}")
         self.load_state_dict(state, strict=True, assign=True)
         n = sum(t.numel() for t in state.values())
-        return {"tensors": len(state), "params": n, "skipped": len(skipped), "load_s": round(time.time() - t0, 2)}
+        return {
+            "tensors": len(state),
+            "params": n,
+            "skipped": len(skipped),
+            "load_s": round(time.time() - t0, 2),
+        }
 
 
 # -- graphs -----------------------------------------------------------------------------------
@@ -237,18 +260,27 @@ class _FullLayerFwd(nn.Module):
         return self.ffn(x), k.contiguous(), v.contiguous()
 
 
-class PrefixEmbed(nn.Module):
-    """``input_ids [B,L]`` + image slots/mask -> prefix embeddings ``[B,L,D]`` (elementwise select)."""
+class VisionEmbedGraph(nn.Module):
+    """Vision tower + prefix embedding assembly in ONE graph (device path).
+
+    ``(patches, pe_idx, pe_w, vcos, vsin, text_emb [B,L,D], place [B,L,M]) -> x [B,L,D]``.
+    ``text_emb`` is the token embedding with image positions zeroed (looked up on the host, cached
+    per prompt); ``place`` is the one-hot image-token placement matrix (``place[b, l, j] = 1`` when
+    sequence position ``l`` holds image token ``j``). ``place @ image_tokens`` is upstream's
+    ``embs[ids == image_token_id] = image_embs`` as a fixed-shape matmul: each output row is one
+    image token times 1.0 plus zeros, so it is exact in any dtype. This replaces a device->host
+    sync of the image tokens, a host scatter, and an eager on-device embedding lookup that cost
+    324 ms of a 382 ms prefix (the lookup against the 250k-row table runs uncompiled).
+    """
 
     def __init__(self, model: InternVLAA15):
         super().__init__()
-        self.embed_tokens = model.vlm.language_model.embed_tokens
+        self.visual = model.vlm.visual
 
-    def forward(self, input_ids, image_slots, image_mask):
-        x = self.embed_tokens(input_ids)
-        m = image_mask.to(x.dtype)
-        return x * (1.0 - m) + image_slots.to(x.dtype) * m
-
+    def forward(self, patches, pe_idx, pe_w, cos, sin, text_emb, place):
+        img = self.visual(patches, pe_idx, pe_w, cos, sin)
+        img = img.reshape(place.shape[0], place.shape[2], -1).to(text_emb.dtype)
+        return text_emb + torch.matmul(place.to(text_emb.dtype), img)
 
 
 class PrefixFullLayer(nn.Module):
@@ -266,23 +298,19 @@ class PrefixFullLayer(nn.Module):
 
 
 class SplitPrefix:
-    """Device prefix driven layer by layer. The GDN layers come in 6 contiguous runs of 3 (the
-    checkpoint's [lin,lin,lin,full] x 6 pattern); each run is fused into ONE compiled graph via
-    A0's :class:`BlockGraphRunner` (``group_size=3``), so the host dispatches once per run of 3
+    """Device prefix driven layer by layer, from the prefix embeddings ``x`` (built by
+    :class:`VisionEmbedGraph`). The GDN layers come in 6 contiguous runs of 3 (the checkpoint's
+    [lin,lin,lin,full] x 6 pattern); each run is fused into ONE compiled graph via A0's
+    :class:`BlockGraphRunner` (``group_size=3``), so the host dispatches once per run of 3
     instead of 3 separate device calls. Full-attention layers (needed individually for their K/V)
-    keep one shared template graph, called once per layer. Measured: 18 separate GDN calls cost
-    99ms (5.5ms/call, dispatch-bound -- see GDN_CHUNK_SIZE's comment); fusing 3-at-a-time cuts the
-    dispatch count 3x without touching the chunk-rule math (so no compile-time blowup, unlike the
-    chunk_size=128 attempt). Returns the stacked full-layer K/V exactly like :class:`PrefixGraph`."""
+    keep one shared template graph, called once per layer with weights bound once at load.
+    Returns the full-layer K and V as two lists (one entry per full-attention layer)."""
 
     def __init__(self, model: InternVLAA15, compile_fn):
         self.lm = model.vlm.language_model
         self.full = model.cfg.vlm.text.full_attention_layers
         self.last = self.full[-1]
         wrap = compile_fn or (lambda mod, name: mod)
-        # The embedding lookup + select is a single cheap op; run it eagerly on device (compiling it
-        # alongside the layer graphs tripped the Lite backend's "doesn't support events" path).
-        self.embed = PrefixEmbed(model)
         full_t = next(ly for ly in self.lm.layers if ly.layer_type == "full_attention")
         self.fullg = wrap(PrefixFullLayer(_FullLayerFwd(full_t)), "internvla_prefix_full")
 
@@ -302,20 +330,23 @@ class SplitPrefix:
             while j < len(layers) and layers[j].layer_type == "linear_attention":
                 j += 1
             run = [_LinearLayerFwd(ly) for ly in layers[i:j]]
-            runner = BlockGraphRunner(run, group_size=len(run), compile_fn=lambda f: wrap(f, "internvla_prefix_linear"))
+            runner = BlockGraphRunner(
+                run, group_size=len(run), compile_fn=lambda f: wrap(f, "internvla_prefix_linear")
+            )
             self.lin_runs.append((i, runner))
             i = j
         self._run_by_start = dict(self.lin_runs)
+        self.refresh_weights()
 
-    @staticmethod
-    def _lin_weights(layer):
-        sub = (layer.input_layernorm, layer.linear_attn, layer.post_attention_layernorm, layer.mlp)
-        prefixes = ("input_layernorm", "linear_attn", "post_attention_layernorm", "mlp")
-        out = {}
-        for pre, mod in zip(prefixes, sub):
-            for n, t in list(mod.named_parameters()) + list(mod.named_buffers()):
-                out[f"{pre}.{n}"] = t.detach()
-        return out
+    def refresh_weights(self) -> None:
+        """Bind each full-attention layer's weight dict once (re-run after moving the model)."""
+        self._full_w = {
+            i: self._full_weights(ly)
+            for i, ly in enumerate(self.lm.layers[: self.last + 1])
+            if ly.layer_type == "full_attention"
+        }
+        for _, runner in self.lin_runs:
+            runner.refresh_weights()
 
     @staticmethod
     def _full_weights(layer):
@@ -327,23 +358,21 @@ class SplitPrefix:
                 out[f"{pre}.{n}"] = t.detach()
         return out
 
-    def __call__(self, input_ids, image_slots, image_mask, cos, sin, bias):
-        x = self.embed(input_ids, image_slots, image_mask)
-        cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+    def __call__(self, x, cos, sin, bias):
         ks, vs = [], []
-        layers = self.lm.layers[: self.last + 1]
+        n = self.last + 1
         i = 0
-        while i < len(layers):
-            if layers[i].layer_type == "linear_attention":
-                runner = self._run_by_start[i]
+        while i < n:
+            runner = self._run_by_start.get(i)
+            if runner is not None:
                 x = runner(x)
                 i += runner.group_size
             else:
-                x, k, v = self.fullg(x, cos, sin, bias, self._full_weights(layers[i]))
+                x, k, v = self.fullg(x, cos, sin, bias, self._full_w[i])
                 ks.append(k)
                 vs.append(v)
                 i += 1
-        return torch.stack(ks), torch.stack(vs)
+        return ks, vs
 
 
 class DenoiseGraph(nn.Module):
@@ -375,7 +404,7 @@ class DenoiseGraph(nn.Module):
             else:
                 x, _ = layer.forward_full(x, cos, sin, bias, past_kv=(ks[j], vs[j]))
                 j += 1
-        x = self.expert.norm(x)[:, -self.chunk:]
+        x = self.expert.norm(x)[:, -self.chunk :]
         return m.action_out_proj(x.float())
 
     def forward(self, x_t, time_emb, dt, cos, sin, bias, ks, vs):
@@ -393,13 +422,24 @@ def pad_bucket(n: int, buckets: tuple[int, ...]) -> int:
 
 
 class InternVLAA15Runner:
-    """Host-side ``sample_actions``: builds every table on the CPU and calls the three graphs.
+    """Host-side ``sample_actions``: builds every table on the CPU and calls the graphs.
 
     ``device`` is ``cpu`` (eager reference) or a Neuron device; ``compile_fn(module, name)``
     returns the callable to use for each graph (identity for eager).
+
+    The CPU path is the reference: whole-prefix graph, exactly upstream's structure. The device
+    path runs one vision+embedding graph, then the split prefix. Request tables that depend only
+    on the prompt and image layout are built once and kept on the device (LRU of
+    ``INTERNVLA_TABLE_CACHE`` entries). Both paths run ``num_inference_steps`` launches of
+    :class:`DenoiseGraph`.
     """
 
-    PREFIX_BUCKETS = tuple(int(b) for b in os.environ.get("INTERNVLA_PREFIX_BUCKETS", "256,384,512,768,1024").split(","))
+    # 448: a 3-camera request with upstream's prompt (task + 32-value state) is 386-388 tokens;
+    # padding it to 448 instead of 512 saves 8 ms of prefix per request (94.3 -> 86.2 ms on trn2)
+    PREFIX_BUCKETS = tuple(
+        int(b)
+        for b in os.environ.get("INTERNVLA_PREFIX_BUCKETS", "256,384,448,512,768,1024").split(",")
+    )
 
     def __init__(self, model: InternVLAA15, device="cpu", compile_fn=None):
         self.model = model
@@ -407,28 +447,46 @@ class InternVLAA15Runner:
         self.device = torch.device(device)
         self.dtype = model.action_in_proj.weight.dtype
         wrap = compile_fn or (lambda mod, name: mod)
-        self.vision = wrap(VisionGraph(model), "internvla_vision")
-        # Whole-prefix single graph overflows the Neuron compiler (NCC_ITEN406); on device drive the
-        # prefix layer by layer (one small compiled graph per layer type). On CPU the single graph is
-        # fine and simpler, and it is what the parity tests exercise.
+        self.timings: dict[str, float] = {}
         if self.device.type == "cpu":
+            self.vision = wrap(VisionGraph(model), "internvla_vision")
             self.prefix = wrap(PrefixGraph(model), "internvla_prefix")
         else:
+            # Whole-prefix single graph overflows the Neuron compiler (NCC_ITEN406); on device drive
+            # the prefix layer by layer (one small compiled graph per layer type).
+            self.vision_embed = wrap(VisionEmbedGraph(model), "internvla_vision_embed")
             self.prefix = SplitPrefix(model, compile_fn)
         self.denoise = wrap(DenoiseGraph(model), "internvla_denoise")
-        self.timings: dict[str, float] = {}
+        self._tables: OrderedDict = OrderedDict()
+        self._table_cache = int(os.environ.get("INTERNVLA_TABLE_CACHE", "16"))
+        self._embed_host = None  # host copy of the token embedding (device path), made on first use
+
+    # Host tables that must reach the device in fp32 (every other float table goes in the model
+    # dtype, see ``_dev``):
+    # * ``vcos``/``vsin``: upstream's vision attention applies its rope in fp32 from fp32 cos/sin.
+    #   Rounded to bf16 they give the image tokens a systematic (not random) error: with them the
+    #   device's end-to-end action error was 1.35x (2 views) / 1.42x (3 views) the CPU-bf16 error
+    #   over 6 noise seeds, with fp32 tables it is below the CPU-bf16 error. The text and suffix
+    #   rope stay bf16: upstream casts those to the model dtype itself.
+    # * ``dt``: the Euler step stays fp32, as upstream (see ``_dev``).
+    FP32_TABLES = ("vcos", "vsin", "dt")
 
     def _dev(self, t, exact: bool = False):
-        """Host->device copy. Host tables (rope cos/sin, additive biases, the time embedding) are
-        cast to the model dtype on the host first -- the graphs were compiled for that signature and
-        up-cast internally where they need fp32, as the Cosmos3-Edge device path does for its rope
-        tables. (The Neuron runtime rejects a dtype change *during* the copy, ``.to(dev, dtype)``;
-        a plain fp32 copy is fine.) ``exact=True`` keeps the dtype: the flow-matching state ``x_t``
-        and the step ``dt`` must stay fp32, as in upstream ``sample_actions`` (it casts ``x_t`` to
-        the model dtype only for the velocity input and keeps the Euler accumulator in fp32).
-        Rounding them to bf16 costs 3.7x the CPU-bf16 error per step (``dt=-0.1`` becomes
-        ``-0.10009766``, a 0.1% step-size bias, and ``x_t`` loses ~0.4% per element)."""
-        if not exact and t.is_floating_point() and t.dtype != self.dtype and self.device.type != "cpu":
+        """Host->device copy. Host tables (text rope cos/sin, additive biases, the time embedding)
+        are cast to the model dtype on the host first -- the graphs were compiled for that signature
+        and up-cast internally where upstream does. (The Neuron runtime rejects a dtype change
+        *during* the copy, ``.to(dev, dtype)``; a plain fp32 copy is fine.) ``exact=True`` keeps the
+        dtype, for the tables in ``FP32_TABLES`` and for the flow-matching state ``x_t``: as in
+        upstream ``sample_actions``, ``x_t`` and ``dt`` stay fp32 (it casts ``x_t`` to the model
+        dtype only for the velocity input and keeps the Euler accumulator in fp32). Rounding them to
+        bf16 costs 3.7x the CPU-bf16 error per step (``dt=-0.1`` becomes ``-0.10009766``, a 0.1%
+        step-size bias, and ``x_t`` loses ~0.4% per element)."""
+        if (
+            not exact
+            and t.is_floating_point()
+            and t.dtype != self.dtype
+            and self.device.type != "cpu"
+        ):
             t = t.to(self.dtype)
         return t.contiguous().to(self.device)
 
@@ -441,7 +499,10 @@ class InternVLAA15Runner:
         ids, mask = batch["input_ids"], batch["attention_mask"]
         grid = batch["image_grid_thw"].view(-1, 3)
         b, n_real = ids.shape
-        if not all(int(t) == 1 for t in grid[:, 0]) or len({(int(h), int(w)) for _, h, w in grid.tolist()}) != 1:
+        if (
+            not all(int(t) == 1 for t in grid[:, 0])
+            or len({(int(h), int(w)) for _, h, w in grid.tolist()}) != 1
+        ):
             raise ValueError("all images must be stills (t=1) of one resolution")
         gh, gw = int(grid[0, 1]), int(grid[0, 2])
         n_img = grid.shape[0]
@@ -473,45 +534,152 @@ class InternVLAA15Runner:
         s = len(pp.suffix_layout(cfg.policy))
         spos = pp.suffix_positions(pos, s)
         scos, ssin = pp.text_rope(spos, vlm.text)
-        temb, dt = pp.time_embedding_table(cfg.policy, cfg.policy.action_expert_hidden_size, self.dtype, b)
+        temb, dt = pp.time_embedding_table(
+            cfg.policy, cfg.policy.action_expert_hidden_size, self.dtype, b
+        )
         return {
-            "patches": patches, "pe_idx": pe_idx, "pe_w": pe_w, "vcos": vcos, "vsin": vsin,
-            "input_ids": ids_p, "img_pos": img_pos, "image_mask": image_mask, "cos": cos, "sin": sin,
+            "patches": patches,
+            "pe_idx": pe_idx,
+            "pe_w": pe_w,
+            "vcos": vcos,
+            "vsin": vsin,
+            "input_ids": ids_p,
+            "img_pos": img_pos,
+            "image_mask": image_mask,
+            "cos": cos,
+            "sin": sin,
             "bias": pp.prefix_bias(pad),
-            "scos": scos, "ssin": ssin, "sbias": pp.suffix_bias(pad, cfg.policy, fast),
-            "temb": temb, "dt": dt.reshape(1), "batch": b, "length": length, "m_img": m_img,
+            "scos": scos,
+            "ssin": ssin,
+            "sbias": pp.suffix_bias(pad, cfg.policy, fast),
+            "temb": temb,
+            "dt": dt.reshape(1),
+            "batch": b,
+            "length": length,
+            "m_img": m_img,
         }
 
-    @torch.inference_mode()
-    def sample_actions(self, batch: dict, noise: torch.Tensor, bucket: int | None = None,
-                       return_trajectory: bool = False):
-        t0 = time.time()
+    def _suffix_tables(self, h: dict) -> dict:
+        """Host tables for the denoise loop."""
+        steps = h["temb"].shape[0]
+        return {
+            "dt": h["dt"],
+            "scos": h["scos"],
+            "ssin": h["ssin"],
+            "sbias": h["sbias"],
+            "temb": [h["temb"][i] for i in range(steps)],
+        }
+
+    def _device_tables(self, batch: dict, bucket: int | None) -> dict:
+        """Device-resident request tables (everything except the pixels), cached per prompt/image
+        layout: rope, biases, vision taps, the time-embedding table, the host-looked-up token
+        embeddings and the image-token placement matrix. A repeated instruction with the same
+        camera layout reuses them; only the pixels go host->device per request."""
+        fast = batch.get("fast_token_mask")
+        key = (
+            batch["input_ids"].numpy().tobytes(),
+            tuple(batch["input_ids"].shape),
+            batch["attention_mask"].numpy().tobytes(),
+            tuple(batch["image_grid_thw"].reshape(-1).tolist()),
+            None if fast is None else fast.numpy().tobytes(),
+            bucket,
+        )
+        hit = self._tables.get(key)
+        if hit is not None:
+            self._tables.move_to_end(key)
+            return hit
         h = self.prepare(batch, bucket)
-        d = self._dev
-        t1 = time.time()
-        img = self.vision(d(h["patches"].to(self.dtype)), d(h["pe_idx"]), d(h["pe_w"]), d(h["vcos"]), d(h["vsin"]))
-        img = img.reshape(h["batch"], h["m_img"], -1)
-        # place each image token's embedding at its sequence position (upstream's masked assign);
-        # done on the host because the compiled graph cannot take a strided gather
-        hid = img.shape[-1]
-        slots = torch.zeros(h["batch"], h["length"], hid, dtype=self.dtype)
-        img_cpu = self._sync(img).to(self.dtype)
+        if self._embed_host is None:
+            self._embed_host = self.model.vlm.language_model.embed_tokens.weight.detach().to("cpu")
+        mask = h["image_mask"].to(self.dtype)
+        text_emb = F.embedding(h["input_ids"], self._embed_host) * (1.0 - mask)
+        place = torch.zeros(h["batch"], h["length"], h["m_img"], dtype=self.dtype)
         for i in range(h["batch"]):
-            slots[i].index_copy_(0, h["img_pos"][i], img_cpu[i])
-        ks, vs = self.prefix(d(h["input_ids"]), d(slots), d(h["image_mask"]), d(h["cos"]), d(h["sin"]), d(h["bias"]))
-        if self.device.type != "cpu":
-            ks.to("cpu")  # sync point for timing only
-        t2 = time.time()
-        x = d(noise.float(), exact=True)  # fp32 Euler accumulator, as upstream
-        dt = d(h["dt"], exact=True)
-        scos, ssin, sbias = d(h["scos"]), d(h["ssin"]), d(h["sbias"])
+            place[i, h["img_pos"][i], torch.arange(h["m_img"])] = 1.0
+        d = self._dev
+        st = {k: h[k] for k in ("batch", "length", "m_img")}
+        st.update(
+            {
+                k: d(h[k], k in self.FP32_TABLES)
+                for k in ("pe_idx", "pe_w", "vcos", "vsin", "cos", "sin", "bias")
+            }
+        )
+        st.update(text_emb=d(text_emb), place=d(place))
+        for k, v in self._suffix_tables(h).items():
+            exact = k in self.FP32_TABLES
+            st[k] = [d(t, exact) for t in v] if isinstance(v, list) else d(v, exact)
+        self._tables[key] = st
+        while len(self._tables) > self._table_cache:
+            self._tables.popitem(last=False)
+        return st
+
+    def _denoise(self, st: dict, x: torch.Tensor, ks, vs, return_trajectory: bool):
         traj = []
-        for i in range(h["temb"].shape[0]):
-            x = self.denoise(x, d(h["temb"][i]), dt, scos, ssin, sbias, ks, vs)
+        for te in st["temb"]:
+            x = self.denoise(x, te, st["dt"], st["scos"], st["ssin"], st["sbias"], ks, vs)
             if return_trajectory:
                 traj.append(self._sync(x).clone())
+        return x, traj
+
+    @torch.inference_mode()
+    def sample_actions(
+        self,
+        batch: dict,
+        noise: torch.Tensor,
+        bucket: int | None = None,
+        return_trajectory: bool = False,
+    ):
+        t0 = time.time()
+        d = self._dev
+        if self.device.type == "cpu":
+            h = self.prepare(batch, bucket)
+            st = {**h, **self._suffix_tables(h)}
+            t1 = time.time()
+            img = self.vision(
+                h["patches"].to(self.dtype), h["pe_idx"], h["pe_w"], h["vcos"], h["vsin"]
+            )
+            img = img.reshape(h["batch"], h["m_img"], -1).to(self.dtype)
+            # place each image token's embedding at its sequence position (upstream's masked assign)
+            slots = torch.zeros(h["batch"], h["length"], img.shape[-1], dtype=self.dtype)
+            for i in range(h["batch"]):
+                slots[i].index_copy_(0, h["img_pos"][i], img[i])
+            ks, vs = self.prefix(
+                h["input_ids"], slots, h["image_mask"], h["cos"], h["sin"], h["bias"]
+            )
+        else:
+            st = self._device_tables(batch, bucket)
+            grid = batch["image_grid_thw"].view(-1, 3)
+            patches = d(
+                batch["pixel_values"]
+                .view(grid.shape[0], int(grid[0, 1] * grid[0, 2]), -1)
+                .to(self.dtype)
+            )
+            t1 = time.time()
+            x = self.vision_embed(
+                patches,
+                st["pe_idx"],
+                st["pe_w"],
+                st["vcos"],
+                st["vsin"],
+                st["text_emb"],
+                st["place"],
+            )
+            ks, vs = self.prefix(x, st["cos"], st["sin"], st["bias"])
+            ks[-1].to("cpu")  # sync point for the stage timing (one 0.4 MB copy)
+            # The denoise graph takes ONE stacked K and ONE stacked V. Fed as 12 separate inputs
+            # (2 x 6 layers) the same graph runs 0.9 ms slower per step (10 steps: 179.3 vs 171.0 ms);
+            # the two stacks cost about 2 ms once per request.
+            ks, vs = torch.stack(ks), torch.stack(vs)
+        t2 = time.time()
+        x = d(noise.float(), exact=True)  # fp32 Euler accumulator, as upstream
+        x, traj = self._denoise(st, x, ks, vs, return_trajectory)
         out = self._sync(x)
         t3 = time.time()
-        self.timings = {"host_prep_s": t1 - t0, "prefix_s": t2 - t1, "denoise_s": t3 - t2, "total_s": t3 - t0}
+        self.timings = {
+            "host_prep_s": t1 - t0,
+            "prefix_s": t2 - t1,
+            "denoise_s": t3 - t2,
+            "total_s": t3 - t0,
+        }
         out = out[:, :, : self.cfg.policy.action_dim]
         return (out, traj) if return_trajectory else out

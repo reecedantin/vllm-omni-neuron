@@ -23,7 +23,9 @@ MASK_VALUE = -2.3819763e38  # upstream OPENPI_ATTENTION_MASK_VALUE
 # -- text mRoPE -------------------------------------------------------------------------------
 
 
-def rope_index(input_ids: torch.Tensor, attention_mask: torch.Tensor, grid_thw: list[list[int]], vlm: VLMConfig):
+def rope_index(
+    input_ids: torch.Tensor, attention_mask: torch.Tensor, grid_thw: list[list[int]], vlm: VLMConfig
+):
     """Upstream ``Qwen3_5Model.get_rope_index`` for images (no video). Returns ``[3, B, L]``."""
     merge = vlm.vision.spatial_merge_size
     b, length = input_ids.shape
@@ -32,7 +34,9 @@ def rope_index(input_ids: torch.Tensor, attention_mask: torch.Tensor, grid_thw: 
     for i in range(b):
         ids = input_ids[i][attention_mask[i] == 1].tolist()
         n_img = sum(
-            1 for j, t in enumerate(ids[:-1]) if t == vlm.vision_start_token_id and ids[j + 1] == vlm.image_token_id
+            1
+            for j, t in enumerate(ids[:-1])
+            if t == vlm.vision_start_token_id and ids[j + 1] == vlm.image_token_id
         )
         chunks, st = [], 0
         for _ in range(n_img):
@@ -80,9 +84,22 @@ def vision_tables(grid_h: int, grid_w: int, vision: VisionConfig):
     dim = vision.head_dim // 2
     inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
     freq_table = torch.outer(torch.arange(max(grid_h, grid_w), dtype=torch.float), inv_freq)
-    br, bc, ir, ic = torch.arange(grid_h // m), torch.arange(grid_w // m), torch.arange(m), torch.arange(m)
-    row = (br[:, None, None, None] * m + ir[None, None, :, None]).expand(grid_h // m, grid_w // m, m, m).reshape(-1)
-    col = (bc[None, :, None, None] * m + ic[None, None, None, :]).expand(grid_h // m, grid_w // m, m, m).reshape(-1)
+    br, bc, ir, ic = (
+        torch.arange(grid_h // m),
+        torch.arange(grid_w // m),
+        torch.arange(m),
+        torch.arange(m),
+    )
+    row = (
+        (br[:, None, None, None] * m + ir[None, None, :, None])
+        .expand(grid_h // m, grid_w // m, m, m)
+        .reshape(-1)
+    )
+    col = (
+        (bc[None, :, None, None] * m + ic[None, None, None, :])
+        .expand(grid_h // m, grid_w // m, m, m)
+        .reshape(-1)
+    )
     rot = freq_table[torch.stack([row, col], -1)].flatten(1)
     emb = torch.cat([rot, rot], dim=-1)
 
@@ -93,19 +110,34 @@ def vision_tables(grid_h: int, grid_w: int, vision: VisionConfig):
     hc, wc = (hf + 1).clip(max=n - 1), (wf + 1).clip(max=n - 1)
     dh, dw = h_idx - hf, w_idx - wf
     bh, bhc = hf * n, hc * n
-    idx = torch.stack([
-        (bh[:, None] + wf[None]).flatten(), (bh[:, None] + wc[None]).flatten(),
-        (bhc[:, None] + wf[None]).flatten(), (bhc[:, None] + wc[None]).flatten(),
-    ]).long()
-    w = torch.stack([
-        ((1 - dh)[:, None] * (1 - dw)[None]).flatten(), ((1 - dh)[:, None] * dw[None]).flatten(),
-        (dh[:, None] * (1 - dw)[None]).flatten(), (dh[:, None] * dw[None]).flatten(),
-    ])
-    perm = torch.arange(grid_h * grid_w).view(grid_h // m, m, grid_w // m, m).permute(0, 2, 1, 3).flatten()
+    idx = torch.stack(
+        [
+            (bh[:, None] + wf[None]).flatten(),
+            (bh[:, None] + wc[None]).flatten(),
+            (bhc[:, None] + wf[None]).flatten(),
+            (bhc[:, None] + wc[None]).flatten(),
+        ]
+    ).long()
+    w = torch.stack(
+        [
+            ((1 - dh)[:, None] * (1 - dw)[None]).flatten(),
+            ((1 - dh)[:, None] * dw[None]).flatten(),
+            (dh[:, None] * (1 - dw)[None]).flatten(),
+            (dh[:, None] * dw[None]).flatten(),
+        ]
+    )
+    perm = (
+        torch.arange(grid_h * grid_w)
+        .view(grid_h // m, m, grid_w // m, m)
+        .permute(0, 2, 1, 3)
+        .flatten()
+    )
     return idx[:, perm].contiguous(), w[:, perm].contiguous(), emb.cos(), emb.sin()
 
 
-def smart_resize(h: int, w: int, factor: int = 32, min_pixels: int = 65536, max_pixels: int = 16777216):
+def smart_resize(
+    h: int, w: int, factor: int = 32, min_pixels: int = 65536, max_pixels: int = 16777216
+):
     """Qwen2-VL ``smart_resize`` (the Qwen3-VL image processor defaults)."""
     hb, wb = max(factor, round(h / factor) * factor), max(factor, round(w / factor) * factor)
     if hb * wb > max_pixels:
@@ -117,8 +149,14 @@ def smart_resize(h: int, w: int, factor: int = 32, min_pixels: int = 65536, max_
     return hb, wb
 
 
-def images_to_patches(images: torch.Tensor, vision: VisionConfig, mean: float = 0.5, std: float = 0.5,
-                      min_pixels: int = 65536, max_pixels: int = 16777216):
+def images_to_patches(
+    images: torch.Tensor,
+    vision: VisionConfig,
+    mean: float = 0.5,
+    std: float = 0.5,
+    min_pixels: int = 65536,
+    max_pixels: int = 16777216,
+):
     """Qwen2-VL image processor for still images in ``[0, 1]`` (``do_rescale=False``, as the
     InternVLA transform calls it). ``images [N,3,H,W]`` -> ``patches [N, P, C*T*p*p]`` in
     merge-block order and the ``(grid_h, grid_w)`` patch grid."""
@@ -155,7 +193,9 @@ def suffix_layout(policy: PolicyConfig) -> list[int]:
     return att
 
 
-def suffix_bias(prefix_pad: torch.Tensor, policy: PolicyConfig, fast_mask: torch.Tensor | None = None):
+def suffix_bias(
+    prefix_pad: torch.Tensor, policy: PolicyConfig, fast_mask: torch.Tensor | None = None
+):
     """Upstream ``denoise_step`` mask: suffix queries see valid (non-fast) prefix keys, plus
     suffix keys by block-causal order. ``[B, 1, S, L + S]`` fp32."""
     b, length = prefix_pad.shape
@@ -199,21 +239,130 @@ def time_embedding(t: torch.Tensor, dim: int, min_period: float, max_period: flo
     return torch.cat([torch.sin(x), torch.cos(x)], dim=1)
 
 
-def time_embedding_table(policy: PolicyConfig, hidden: int, dtype: torch.dtype, batch: int = 1,
-                         num_steps: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def time_embedding_table(
+    policy: PolicyConfig,
+    hidden: int,
+    dtype: torch.dtype,
+    batch: int = 1,
+    num_steps: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``[steps, B, hidden]`` in ``dtype`` (upstream casts the timestep to the model dtype first)
     and ``dt``."""
     times, dt = time_schedule(num_steps or policy.num_inference_steps)
-    rows = [time_embedding(t.expand(batch).to(dtype), hidden, policy.min_period, policy.max_period).to(dtype)
-            for t in times]
+    rows = [
+        time_embedding(t.expand(batch).to(dtype), hidden, policy.min_period, policy.max_period).to(
+            dtype
+        )
+        for t in times
+    ]
     return torch.stack(rows), dt
+
+
+# -- observation -> request (served path) -----------------------------------------------------
+
+SYSTEM_MESSAGE = "You are a helpful physical assistant."  # upstream lerobot.transforms.constants
+
+
+def state_text(state, max_state_dim: int) -> str:
+    """Upstream ``InternVLAA15ChatProcessorTransformFn._encode_state`` (``tokenize_state=True``):
+    the normalised state, zero-padded to ``max_state_dim``, divided by 3 and binned into 256
+    levels on [-1, 1], written as text."""
+    import numpy as np
+
+    s = np.asarray(state, dtype=np.float32).reshape(-1)
+    if s.shape[0] < max_state_dim:
+        s = np.pad(s, (0, max_state_dim - s.shape[0]))
+    disc = np.digitize(s / 3, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+    return "State: " + " ".join(map(str, disc))
+
+
+def prompt_text(
+    n_images: int,
+    task: str,
+    state=None,
+    *,
+    max_state_dim: int = 32,
+    control_mode: str = "joint",
+    language_memory: str = "",
+) -> list[dict]:
+    """The chat messages upstream builds for inference (``mode="eval"``, no labels): system
+    message, then one user turn with the images followed by
+    ``Task: <task>[; <memory>]; Control Mode: <mode>[; State: ...]; Output: <Subtask, Action>``."""
+    user = "Task: " + str(task)
+    if str(language_memory).strip():
+        user += "; " + str(language_memory).strip()
+    user += f"; Control Mode: <{control_mode}>"
+    if state is not None:
+        user += "; " + state_text(state, max_state_dim)
+    user += "; Output: <Subtask, Action>"
+    content = [{"type": "image"} for _ in range(n_images)] + [{"type": "text", "text": user}]
+    return [{"role": "system", "content": SYSTEM_MESSAGE}, {"role": "user", "content": content}]
+
+
+def observation_request(
+    cfg: InternVLAConfig,
+    images: torch.Tensor,
+    task: str,
+    tokenizer,
+    state=None,
+    *,
+    control_mode: str = "joint",
+    language_memory: str = "",
+) -> dict:
+    """One robot observation -> the model's batch dict, as upstream's ``Qwen3VLProcessor`` call in
+    ``InternVLAA15ChatProcessorTransformFn`` builds it for inference: the Qwen3.5 chat template
+    with ``add_generation_prompt=True``, each ``<|image_pad|>`` expanded to the image's merged
+    token count, no padding. ``images [N,3,H,W]`` in ``[0, 1]``; ``tokenizer`` is the Qwen3.5
+    tokenizer (its chat template is the one upstream applies). The state, when given, goes in the
+    prompt as text (``tokenize_state``); it must already be normalised with the checkpoint's stats."""
+    patches, (gh, gw) = images_to_patches(images, cfg.vlm.vision)
+    n = images.shape[0]
+    merge = cfg.vlm.vision.spatial_merge_size
+    n_tok = (gh * gw) // (merge * merge)
+    if not cfg.policy.tokenize_state:
+        raise NotImplementedError(
+            "checkpoints with a state projection (tokenize_state=False) are not served"
+        )
+    msgs = prompt_text(
+        n,
+        task,
+        state,
+        max_state_dim=cfg.policy.max_state_dim,
+        control_mode=control_mode,
+        language_memory=language_memory,
+    )
+    text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    ids: list[int] = []
+    for i in tokenizer(text, add_special_tokens=False).input_ids:
+        ids += [i] * n_tok if i == cfg.vlm.image_token_id else [i]
+    input_ids = torch.tensor([ids], dtype=torch.long)
+    if int((input_ids == cfg.vlm.image_token_id).sum()) != n * n_tok:
+        raise ValueError("tokenizer does not map <|image_pad|> to the checkpoint's image_token_id")
+    st = torch.zeros(1, cfg.policy.max_state_dim)
+    if state is not None:
+        s = torch.as_tensor(state, dtype=torch.float32).reshape(-1)[: cfg.policy.max_state_dim]
+        st[0, : s.shape[0]] = s
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "pixel_values": patches.reshape(n * gh * gw, -1),
+        "image_grid_thw": torch.tensor([[1, gh, gw]] * n, dtype=torch.long),
+        "state": st,  # carried for upstream's batch layout; with tokenize_state the model reads the text
+    }
 
 
 # -- synthetic requests (tests, device smoke) -------------------------------------------------
 
 
-def synthetic_request(cfg: InternVLAConfig, n_images: int = 3, grid: tuple[int, int] = (14, 14),
-                      text_before: int = 12, text_after: int = 60, seed: int = 0, batch: int = 1):
+def synthetic_request(
+    cfg: InternVLAConfig,
+    n_images: int = 3,
+    grid: tuple[int, int] = (14, 14),
+    text_before: int = 12,
+    text_after: int = 60,
+    seed: int = 0,
+    batch: int = 1,
+):
     """A structurally valid request with random tokens/pixels: ``text_before`` tokens, then per
     image ``<vision_start> <image_pad> x N <vision_end>``, then ``text_after`` tokens.
 
@@ -228,13 +377,24 @@ def synthetic_request(cfg: InternVLAConfig, n_images: int = 3, grid: tuple[int, 
     for _ in range(batch):
         ids = torch.randint(1000, 200000, (text_before,), generator=g).tolist()
         for _ in range(n_images):
-            ids += [vlm.vision_start_token_id] + [vlm.image_token_id] * n_tok + [vlm.vision_end_token_id]
+            ids += (
+                [vlm.vision_start_token_id]
+                + [vlm.image_token_id] * n_tok
+                + [vlm.vision_end_token_id]
+            )
         ids += torch.randint(1000, 200000, (text_after,), generator=g).tolist()
         rows.append(ids)
     input_ids = torch.tensor(rows, dtype=torch.long)
     v = vlm.vision
-    pix = torch.rand(batch * n_images * gh * gw, v.in_channels * v.temporal_patch_size * v.patch_size**2,
-                     generator=g) * 2 - 1
+    pix = (
+        torch.rand(
+            batch * n_images * gh * gw,
+            v.in_channels * v.temporal_patch_size * v.patch_size**2,
+            generator=g,
+        )
+        * 2
+        - 1
+    )
     return {
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids),
@@ -247,4 +407,6 @@ def synthetic_request(cfg: InternVLAConfig, n_images: int = 3, grid: tuple[int, 
 def initial_noise(cfg: InternVLAConfig, batch: int = 1, seed: int = 0) -> torch.Tensor:
     """fp32 standard normal ``[B, chunk, max_action_dim]`` (upstream ``sample_noise``)."""
     g = torch.Generator().manual_seed(seed)
-    return torch.randn(batch, cfg.policy.chunk_size, cfg.policy.max_action_dim, generator=g, dtype=torch.float32)
+    return torch.randn(
+        batch, cfg.policy.chunk_size, cfg.policy.max_action_dim, generator=g, dtype=torch.float32
+    )

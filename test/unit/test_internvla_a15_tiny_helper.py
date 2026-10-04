@@ -42,7 +42,10 @@ TINY_VLM = {
         "head_dim": 32,
         "attn_output_gate": True,
         "full_attention_interval": 4,
-        "layer_types": ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 3 + ["full_attention"],
+        "layer_types": ["linear_attention"] * 3
+        + ["full_attention"]
+        + ["linear_attention"] * 3
+        + ["full_attention"],
         "linear_conv_kernel_dim": 4,
         "linear_key_head_dim": 16,
         "linear_value_head_dim": 16,
@@ -83,39 +86,41 @@ TINY_VLM = {
 
 def tiny_policy_config(real: dict | None = None) -> dict:
     cfg = dict(real or {})
-    cfg.update({
-        "type": "internvla_a1_5",
-        # vLLM-Omni's OmniDiffusionConfig.enrich_config has no built-in model_type mapping for a
-        # third-party policy (unlike its hardcoded "Gr00tN1d7" case); its generic fallback is
-        # `architectures == [class_name]` matched against the DiffusionModelRegistry, so this is
-        # how a checkpoint tells the engine which pipeline class to use.
-        "architectures": ["InternVLAA15Pipeline"],
-        "n_obs_steps": 1,
-        "input_features": {"observation.state": {"type": "STATE", "shape": [32]}},
-        "output_features": {"action": {"type": "ACTION", "shape": [32]}},
-        "vlm_model_name_or_path": "vlm",
-        "action_expert_hidden_size": 32,
-        "action_expert_intermediate_size": 64,
-        "dtype": "bfloat16",
-        "chunk_size": 50,
-        "n_action_steps": 50,
-        "max_state_dim": 32,
-        "max_action_dim": 32,
-        "num_inference_steps": 10,
-        "min_period": 0.004,
-        "max_period": 4.0,
-        "image_resolution": [224, 224],
-        "tokenizer_max_length": 48,
-        "tokenize_state": True,
-        "action_token_min": 248077,
-        "action_token_max": 250124,
-        "knowledge_insulation": False,
-        "block_action_attend_fast_tokens": True,
-        "inference_action_type": "fm",
-        "num_learnable_tokens": 50,
-        "action_loss_only": False,
-        "inference_backend": "standard",
-    })
+    cfg.update(
+        {
+            "type": "internvla_a1_5",
+            # vLLM-Omni's OmniDiffusionConfig.enrich_config has no built-in model_type mapping for a
+            # third-party policy (unlike its hardcoded "Gr00tN1d7" case); its generic fallback is
+            # `architectures == [class_name]` matched against the DiffusionModelRegistry, so this is
+            # how a checkpoint tells the engine which pipeline class to use.
+            "architectures": ["InternVLAA15Pipeline"],
+            "n_obs_steps": 1,
+            "input_features": {"observation.state": {"type": "STATE", "shape": [32]}},
+            "output_features": {"action": {"type": "ACTION", "shape": [32]}},
+            "vlm_model_name_or_path": "vlm",
+            "action_expert_hidden_size": 32,
+            "action_expert_intermediate_size": 64,
+            "dtype": "bfloat16",
+            "chunk_size": 50,
+            "n_action_steps": 50,
+            "max_state_dim": 32,
+            "max_action_dim": 32,
+            "num_inference_steps": 10,
+            "min_period": 0.004,
+            "max_period": 4.0,
+            "image_resolution": [224, 224],
+            "tokenizer_max_length": 48,
+            "tokenize_state": True,
+            "action_token_min": 248077,
+            "action_token_max": 250124,
+            "knowledge_insulation": False,
+            "block_action_attend_fast_tokens": True,
+            "inference_action_type": "fm",
+            "num_learnable_tokens": 50,
+            "action_loss_only": False,
+            "inference_backend": "standard",
+        }
+    )
     return cfg
 
 
@@ -149,12 +154,18 @@ def _tensors(seed: int) -> dict[str, torch.Tensor]:
                 nv = t["linear_num_value_heads"]
                 out[f"{la}.A_log"] = torch.log(torch.rand(nv, generator=g) * 15 + 1).to(bf)
                 out[f"{la}.dt_bias"] = (torch.rand(nv, generator=g) * 2 - 1).to(bf)
-                out[f"{la}.conv1d.weight"] = rnd(2 * kd + vd, 1, t["linear_conv_kernel_dim"], std=0.3)
-                out[f"{la}.in_proj_qkv.weight"] = rnd(2 * kd + vd, hidden, std=1 / math.sqrt(hidden))
+                out[f"{la}.conv1d.weight"] = rnd(
+                    2 * kd + vd, 1, t["linear_conv_kernel_dim"], std=0.3
+                )
+                out[f"{la}.in_proj_qkv.weight"] = rnd(
+                    2 * kd + vd, hidden, std=1 / math.sqrt(hidden)
+                )
                 out[f"{la}.in_proj_z.weight"] = rnd(vd, hidden, std=1 / math.sqrt(hidden))
                 out[f"{la}.in_proj_a.weight"] = rnd(nv, hidden, std=1 / math.sqrt(hidden))
                 out[f"{la}.in_proj_b.weight"] = rnd(nv, hidden, std=1 / math.sqrt(hidden))
-                out[f"{la}.norm.weight"] = (1 + rnd(t["linear_value_head_dim"], std=0.1, dtype=f32)).to(bf)
+                out[f"{la}.norm.weight"] = (
+                    1 + rnd(t["linear_value_head_dim"], std=0.1, dtype=f32)
+                ).to(bf)
                 out[f"{la}.out_proj.weight"] = rnd(hidden, vd, std=1 / math.sqrt(vd))
             else:
                 sa = f"{p}.self_attn"
@@ -176,8 +187,14 @@ def _tensors(seed: int) -> dict[str, torch.Tensor]:
     vis = f"{vlm}.model.visual"
     vh, vi = v["hidden_size"], v["intermediate_size"]
     k = v["in_channels"] * v["temporal_patch_size"] * v["patch_size"] ** 2
-    out[f"{vis}.patch_embed.proj.weight"] = rnd(vh, v["in_channels"], v["temporal_patch_size"], v["patch_size"],
-                                                v["patch_size"], std=1 / math.sqrt(k))
+    out[f"{vis}.patch_embed.proj.weight"] = rnd(
+        vh,
+        v["in_channels"],
+        v["temporal_patch_size"],
+        v["patch_size"],
+        v["patch_size"],
+        std=1 / math.sqrt(k),
+    )
     out[f"{vis}.patch_embed.proj.bias"] = rnd(vh, std=0.02)
     out[f"{vis}.pos_embed.weight"] = rnd(v["num_position_embeddings"], vh, std=0.2)
     for i in range(v["depth"]):
@@ -226,8 +243,11 @@ def make_tiny_checkpoint(out_dir: str, seed: int = 0) -> str:
     os.makedirs(os.path.join(out_dir, "vlm"), exist_ok=True)
     tensors = _tensors(seed)
     emb = "model.qwen3_5_with_expert.qwen3_5.model.language_model.embed_tokens.weight"
-    save_file({k: v.contiguous() for k, v in tensors.items()}, os.path.join(out_dir, "model.safetensors"),
-              metadata={emb: "model.qwen3_5_with_expert.qwen3_5.lm_head.weight"})
+    save_file(
+        {k: v.contiguous() for k, v in tensors.items()},
+        os.path.join(out_dir, "model.safetensors"),
+        metadata={emb: "model.qwen3_5_with_expert.qwen3_5.lm_head.weight"},
+    )
     with open(os.path.join(out_dir, "config.json"), "w") as f:
         json.dump(tiny_policy_config(), f, indent=2)
     with open(os.path.join(out_dir, "vlm", "config.json"), "w") as f:

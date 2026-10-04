@@ -21,7 +21,9 @@ import types
 import torch
 import torch.nn as nn
 
-_REF_QWEN = "lerobot/policies/internvla_a1_5/transformers_replace/models/qwen3_5/modeling_qwen3_5.py"
+_REF_QWEN = (
+    "lerobot/policies/internvla_a1_5/transformers_replace/models/qwen3_5/modeling_qwen3_5.py"
+)
 _REF_MODEL = "lerobot/policies/internvla_a1_5/modeling_internvla_a1_5.py"
 
 
@@ -55,7 +57,9 @@ def load_upstream_module(src: str):
         return _LOADED["mod"]
     import transformers.models.qwen3_5 as q35
 
-    qwen = _exec("transformers.models.qwen3_5._internvla_upstream_modeling", os.path.join(src, _REF_QWEN))
+    qwen = _exec(
+        "transformers.models.qwen3_5._internvla_upstream_modeling", os.path.join(src, _REF_QWEN)
+    )
     _create_causal_mask = qwen.create_causal_mask
 
     def create_causal_mask(config, inputs_embeds, attention_mask, cache_position=None, **kw):
@@ -63,33 +67,55 @@ def load_upstream_module(src: str):
         # passes a prepared 4D mask, which every version returns as-is
         if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4:
             return attention_mask
-        return _create_causal_mask(config=config, inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kw)
+        return _create_causal_mask(
+            config=config, inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kw
+        )
 
     qwen.create_causal_mask = create_causal_mask
     saved = {k: sys.modules.get(k) for k in ("transformers.models.qwen3_5.modeling_qwen3_5",)}
     sys.modules["transformers.models.qwen3_5.modeling_qwen3_5"] = qwen
-    saved_attrs = {k: getattr(q35, k, None) for k in ("modeling_qwen3_5", "Qwen3_5ForConditionalGeneration",
-                                                     "Qwen3_5TextModel")}
+    saved_attrs = {
+        k: getattr(q35, k, None)
+        for k in ("modeling_qwen3_5", "Qwen3_5ForConditionalGeneration", "Qwen3_5TextModel")
+    }
     q35.modeling_qwen3_5 = qwen
     q35.Qwen3_5ForConditionalGeneration = qwen.Qwen3_5ForConditionalGeneration
     q35.Qwen3_5TextModel = qwen.Qwen3_5TextModel
     try:
-        for pkg in ("lerobot", "lerobot.policies", "lerobot.policies.internvla_a1_5", "lerobot.policies.internvla_a1_5.wan",
-                    "lerobot.policies.internvla_a1_5.wan.modules", "lerobot.policies.internvla_a1_5.wan.utils",
-                    "lerobot.utils", "lerobot.transforms"):
+        for pkg in (
+            "lerobot",
+            "lerobot.policies",
+            "lerobot.policies.internvla_a1_5",
+            "lerobot.policies.internvla_a1_5.wan",
+            "lerobot.policies.internvla_a1_5.wan.modules",
+            "lerobot.policies.internvla_a1_5.wan.utils",
+            "lerobot.utils",
+            "lerobot.transforms",
+        ):
             _stub(pkg)
-        _exec("lerobot.policies.internvla_a1_5.action_tokens",
-              os.path.join(src, "lerobot/policies/internvla_a1_5/action_tokens.py"))
-        _stub("lerobot.policies.internvla_a1_5.configuration_internvla_a1_5", InternVLAA15Config=object)
+        _exec(
+            "lerobot.policies.internvla_a1_5.action_tokens",
+            os.path.join(src, "lerobot/policies/internvla_a1_5/action_tokens.py"),
+        )
+        _stub(
+            "lerobot.policies.internvla_a1_5.configuration_internvla_a1_5",
+            InternVLAA15Config=object,
+        )
         _stub("lerobot.policies.internvla_a1_5.wan_model", WanVideoModel=None)
         _stub("lerobot.policies.internvla_a1_5.wan.modules.model", sinusoidal_embedding_1d=None)
         _stub("lerobot.policies.internvla_a1_5.wan.utils.fm", FlowMatchScheduler=None)
-        _stub("lerobot.policies.internvla_a1_5.transform_internvla_a1_5", LABEL_MODE_FAST=2, LABEL_MODE_NONE=0,
-              LABEL_MODE_TEXT=1)
+        _stub(
+            "lerobot.policies.internvla_a1_5.transform_internvla_a1_5",
+            LABEL_MODE_FAST=2,
+            LABEL_MODE_NONE=0,
+            LABEL_MODE_TEXT=1,
+        )
         _stub("lerobot.policies.pretrained", PreTrainedPolicy=nn.Module)
         _stub("lerobot.utils.utils", format_big_number=str)
         _exec("lerobot.utils.constants", os.path.join(src, "lerobot/utils/constants.py"))
-        model = _exec("lerobot.policies.internvla_a1_5.modeling_internvla_a1_5", os.path.join(src, _REF_MODEL))
+        model = _exec(
+            "lerobot.policies.internvla_a1_5.modeling_internvla_a1_5", os.path.join(src, _REF_MODEL)
+        )
     finally:
         for k, v in saved.items():
             if v is not None:
@@ -143,12 +169,13 @@ def build_upstream(model_path: str, vlm_config_path: str, dtype: torch.dtype, sr
     state = {}
     with safe_open(st, "pt") as f:
         for k in f.keys():
-            name = k[len("model."):]
+            name = k[len("model.") :]
             if name.startswith(("learnable_to_wan_proj.", "_wan_grid_sizes")):
                 continue
             state[name] = f.get_tensor(k)
     state["qwen3_5_with_expert.qwen3_5.model.language_model.embed_tokens.weight"] = state[
-        "qwen3_5_with_expert.qwen3_5.lm_head.weight"]
+        "qwen3_5_with_expert.qwen3_5.lm_head.weight"
+    ]
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         raise RuntimeError(f"upstream load: missing={missing[:5]} unexpected={unexpected[:5]}")
@@ -162,6 +189,11 @@ def upstream_sample(model, batch: dict, noise: torch.Tensor, dtype: torch.dtype)
     """Upstream ``predict_action_chunk`` (state cast to the model dtype, as the openloop eval)."""
     state = batch["state"].to(dtype)
     return model.sample_actions(
-        batch["pixel_values"].to(dtype), batch["image_grid_thw"], batch["input_ids"], batch["attention_mask"],
-        state, fast_token_mask=batch.get("fast_token_mask"), noise=noise.clone(),
+        batch["pixel_values"].to(dtype),
+        batch["image_grid_thw"],
+        batch["input_ids"],
+        batch["attention_mask"],
+        state,
+        fast_token_mask=batch.get("fast_token_mask"),
+        noise=noise.clone(),
     )
