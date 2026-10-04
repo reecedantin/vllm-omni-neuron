@@ -1,0 +1,15 @@
+Files in this directory are vendored from Hugging Face diffusers
+(https://github.com/huggingface/diffusers, commit 8b33bfc), licensed under the Apache License, Version 2.0.
+Copyright 2026 The MiniMax and HuggingFace Teams.
+
+The pinned diffusers==0.38.0 predates MiniMax-H3. Sources:
+
+  src/diffusers/models/transformers/transformer_minimax_h3.py      -> transformer_minimax_h3.py
+  src/diffusers/models/autoencoders/autoencoder_kl_minimax_h3.py   -> autoencoder_kl_minimax_h3.py
+  src/diffusers/models/autoencoders/autoencoder_kl_minimax_h3_audio.py -> autoencoder_kl_minimax_h3_audio.py
+  src/diffusers/schedulers/scheduling_minimax_h3.py                -> scheduling_minimax_h3.py
+  src/diffusers/modular_pipelines/minimax_h3/<name>.py             -> mp_<name>.py
+
+Local patches: relative imports rewritten to absolute `diffusers.*` imports or to the sibling vendored modules;
+`MiniMaxH3LoraLoaderMixin` (unused) and `maybe_adjust_dtype_for_device` (diffusers main only) come from
+_compat.py. No numerical code was changed.
