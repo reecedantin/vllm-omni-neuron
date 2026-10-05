@@ -1,0 +1,29 @@
+# FLUX 3 Action policy served through the vLLM-Omni stage harness on Neuron.
+# TP1 (the 7B DiT is ~14 GB bf16, fits one 24 GB core). TP4 x CFG2 on eight cores
+# (flux3_action_stage_tp4_cfg2.yaml) is the recommended configuration. Select cores with NEURON_VISIBLE_DEVICES (comma list, logical indices) and leave
+# NEURON_RT_VISIBLE_CORES unset: the multi-process stage refuses it. The DiT, the solver's model calls and the
+# frozen VAE encoder run on device.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Flux3ActionPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # Shared encoders (video VAE + Qwen3-VL text encoder) of black-forest-labs/flux-3-action-base:
+        # set flux3_action_base: <dir> or $FLUX3_ACTION_BASE for a local copy; otherwise the revision
+        # the policy config pins is read from the Hugging Face Hub (or its offline cache).
+        decode_frames: false
+        # VAE encoder on the NeuronCore (rank 0 under TP); "host" runs it on the CPU instead
+        vae_device: device
+        # caption encoder layers on the NeuronCore (over the TP group, cached per caption); "host" = CPU
+        text_encoder_device: device
+      parallel_config:
+        tensor_parallel_size: 1
