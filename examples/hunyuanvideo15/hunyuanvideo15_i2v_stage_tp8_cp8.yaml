@@ -1,0 +1,23 @@
+# HunyuanVideo-1.5 I2V on Neuron, the whole trn2.48xlarge (64 logical cores): TP=8 x context-parallel 8, one forward
+# per step (CFG-distilled checkpoints, e.g. 720p_i2v_distilled_sparse). TP = the rows of the 8x8 core mesh (adjacent
+# chip pairs), CP = its columns (the plugin's physical-mesh layout B). At 720p 121 frames each CP rank owns 45 of the
+# 360 SSTA tiles (video K/V all-gathered per block, text query tiles split). Needs HV15_BLOCKS_PER_GRAPH > 0.
+# The VAE decode tiles are dealt across all 64 ranks.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: HunyuanVideo15ImageToVideoPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        vae_dtype: bfloat16
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 8

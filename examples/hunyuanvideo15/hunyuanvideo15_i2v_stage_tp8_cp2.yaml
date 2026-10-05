@@ -1,0 +1,23 @@
+# HunyuanVideo-1.5 I2V on Neuron, four Trn2 chips (16 logical cores): TP=8 x context-parallel 2, one forward per
+# step (CFG-distilled checkpoints, e.g. 720p_i2v_distilled_sparse). TP = one adjacent chip pair, CP = the matching
+# cores of the two pairs (the plugin's physical-mesh layout B). The sparse checkpoint's SSTA tiles are dealt to the
+# CP ranks as whole tiles (video K/V all-gathered per block, text query tiles split). Needs HV15_BLOCKS_PER_GRAPH > 0.
+# The VAE decode tiles are dealt across all 16 ranks.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: HunyuanVideo15ImageToVideoPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        vae_dtype: bfloat16
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 2
