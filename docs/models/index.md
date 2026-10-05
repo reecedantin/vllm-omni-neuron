@@ -24,7 +24,7 @@ Image-to-video recipe for WAN 2.2 A14B on Trainium.
 :::{toctree}
 :maxdepth: 1
 :hidden:
+:glob:
 
-WAN 2.2 T2V <wan22-t2v-14b>
-WAN 2.2 I2V <wan22-i2v-14b>
+*
 :::
