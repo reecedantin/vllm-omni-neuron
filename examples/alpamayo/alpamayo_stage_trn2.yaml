@@ -1,0 +1,26 @@
+# Alpamayo 1.5 (10B) on Trainium2 (vLLM-Omni), recommended layout: tensor-parallel across the 4
+# NeuronCores of one chip (LNC=2). Pick 4 cores of the same chip (4d..4d+3). Alternatives:
+# alpamayo_stage_trn2_tp8.yaml (lowest latency, an adjacent chip pair) and
+# alpamayo_stage_trn2_tp2.yaml (two cores).
+# The vision tower, the VLM text decoder (36 layers, 8 KV heads) and the flow-matching expert all shard their
+# attention heads / MLPs via vllm_neuron ColumnParallelLinear/RowParallelLinear.
+#
+# With multi-process TP, `devices:` is a comma list of logical indices into NEURON_VISIBLE_DEVICES
+# (e.g. NEURON_VISIBLE_DEVICES=8,9 -> "0,1" are cores 8 and 9), not a range; leave
+# NEURON_RT_VISIBLE_CORES unset.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: actions
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Alpamayo1_5
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config: {}
+      parallel_config:
+        tensor_parallel_size: 4
