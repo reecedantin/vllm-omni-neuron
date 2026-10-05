@@ -18,14 +18,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...utils import logging
-from ...utils.accelerate_utils import apply_forward_hook
-from ..attention import AttentionMixin, AttentionModuleMixin, FeedForward
-from ..attention_dispatch import dispatch_attention_fn
-from ..modeling_outputs import AutoencoderKLOutput
-from ..modeling_utils import ModelMixin, get_parameter_dtype
-from .vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.utils import logging
+from diffusers.utils.accelerate_utils import apply_forward_hook
+from diffusers.models.attention import AttentionMixin, AttentionModuleMixin, FeedForward
+from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from diffusers.models.modeling_utils import ModelMixin, get_parameter_dtype
+from diffusers.models.autoencoders.vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name

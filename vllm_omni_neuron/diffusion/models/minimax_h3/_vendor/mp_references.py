@@ -37,9 +37,9 @@ import requests
 import torch
 from PIL import Image
 
-from ...utils import is_av_available, load_image
-from ...utils.constants import DIFFUSERS_REQUEST_TIMEOUT
-from .modular_pipeline import MINIMAX_H3_FPS
+from diffusers.utils import is_av_available, load_image
+from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
+from .mp_modular_pipeline import MINIMAX_H3_FPS
 
 
 @dataclass

@@ -42,14 +42,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...utils import BaseOutput
-from ...utils.accelerate_utils import apply_forward_hook
-from ...utils.torch_utils import randn_tensor
-from ..attention import AttentionMixin, AttentionModuleMixin
-from ..attention_dispatch import dispatch_attention_fn
-from ..modeling_utils import ModelMixin, get_parameter_dtype
-from .vae import DecoderOutput
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.utils import BaseOutput
+from diffusers.utils.accelerate_utils import apply_forward_hook
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.models.attention import AttentionMixin, AttentionModuleMixin
+from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.modeling_utils import ModelMixin, get_parameter_dtype
+from diffusers.models.autoencoders.vae import DecoderOutput
 
 
 class MiniMaxH3AudioDiagonalGaussianDistribution:

@@ -14,9 +14,9 @@
 
 import torch
 
-from ..modular_pipeline import ConditionalPipelineBlocks, SequentialPipelineBlocks
-from ..modular_pipeline_utils import OutputParam
-from .before_denoise import (
+from diffusers.modular_pipelines.modular_pipeline import ConditionalPipelineBlocks, SequentialPipelineBlocks
+from diffusers.modular_pipelines.modular_pipeline_utils import OutputParam
+from .mp_before_denoise import (
     MiniMaxH3FL2VAPrepareLatentsStep,
     MiniMaxH3NoKeyframeAnchorsStep,
     MiniMaxH3PrepareConditionLatentsStep,
@@ -26,10 +26,10 @@ from .before_denoise import (
     MiniMaxH3Ref2VAPrepareLayoutStep,
     MiniMaxH3SetTimestepsStep,
 )
-from .before_encoder import MiniMaxH3Ref2VASetupStep, MiniMaxH3ResizeStep
-from .decoders import MiniMaxH3AfterDenoiseStep, MiniMaxH3AudioDecodeStep, MiniMaxH3VideoDecodeStep
-from .denoise import MiniMaxH3DenoiseStep, MiniMaxH3Ref2VADenoiseStep
-from .encoders import (
+from .mp_before_encoder import MiniMaxH3Ref2VASetupStep, MiniMaxH3ResizeStep
+from .mp_decoders import MiniMaxH3AfterDenoiseStep, MiniMaxH3AudioDecodeStep, MiniMaxH3VideoDecodeStep
+from .mp_denoise import MiniMaxH3DenoiseStep, MiniMaxH3Ref2VADenoiseStep
+from .mp_encoders import (
     MiniMaxH3FL2VATextEncoderStep,
     MiniMaxH3KeyframeVaeEncoderStep,
     MiniMaxH3Ref2VAReferenceEncoderStep,

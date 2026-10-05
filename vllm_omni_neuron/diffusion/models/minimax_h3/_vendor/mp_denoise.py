@@ -16,17 +16,17 @@ import inspect
 
 import torch
 
-from ...models import MiniMaxH3Transformer3DModel
-from ...schedulers import MiniMaxH3Scheduler
-from ...utils import logging
-from ..modular_pipeline import (
+from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from .scheduling_minimax_h3 import MiniMaxH3Scheduler
+from diffusers.utils import logging
+from diffusers.modular_pipelines.modular_pipeline import (
     BlockState,
     LoopSequentialPipelineBlocks,
     ModularPipelineBlocks,
     PipelineState,
 )
-from ..modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
-from .modular_pipeline import MiniMaxH3ModularPipeline
+from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
+from .mp_modular_pipeline import MiniMaxH3ModularPipeline
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name

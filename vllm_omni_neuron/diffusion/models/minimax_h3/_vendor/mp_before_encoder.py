@@ -19,17 +19,17 @@ import PIL
 import torch
 from PIL import Image
 
-from ...configuration_utils import FrozenDict
-from ...image_processor import VaeImageProcessor
-from ...utils import logging
-from ..modular_pipeline import ModularPipelineBlocks, PipelineState
-from ..modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, OutputParam
-from .modular_pipeline import (
+from diffusers.configuration_utils import FrozenDict
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.utils import logging
+from diffusers.modular_pipelines.modular_pipeline import ModularPipelineBlocks, PipelineState
+from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, OutputParam
+from .mp_modular_pipeline import (
     MiniMaxH3ModularPipeline,
     align_num_frames,
     resolve_canvas_size,
 )
-from .references import (
+from .mp_references import (
     MiniMaxH3AudioReference,
     MiniMaxH3ImageReference,
     MiniMaxH3Reference,

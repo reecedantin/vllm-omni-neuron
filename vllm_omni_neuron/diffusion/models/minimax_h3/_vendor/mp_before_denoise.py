@@ -15,19 +15,21 @@
 import numpy as np
 import torch
 
-from ...schedulers import MiniMaxH3Scheduler
-from ...utils import logging
-from ...utils.torch_utils import maybe_adjust_dtype_for_device, randn_tensor
-from ..modular_pipeline import ModularPipelineBlocks, PipelineState
-from ..modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, OutputParam
-from .modular_pipeline import (
+from .scheduling_minimax_h3 import MiniMaxH3Scheduler
+from diffusers.utils import logging
+from diffusers.utils.torch_utils import randn_tensor
+
+from ._compat import maybe_adjust_dtype_for_device
+from diffusers.modular_pipelines.modular_pipeline import ModularPipelineBlocks, PipelineState
+from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, OutputParam
+from .mp_modular_pipeline import (
     MiniMaxH3ModularPipeline,
     align_num_frames,
     audio_latent_num_frames,
     resolve_canvas_size,
     video_latent_num_frames,
 )
-from .references import MiniMaxH3Reference
+from .mp_references import MiniMaxH3Reference
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name

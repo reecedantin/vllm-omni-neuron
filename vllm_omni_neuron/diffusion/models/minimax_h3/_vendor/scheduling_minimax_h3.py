@@ -39,9 +39,9 @@ from dataclasses import dataclass
 
 import torch
 
-from ..configuration_utils import ConfigMixin, register_to_config
-from ..utils import BaseOutput
-from .scheduling_utils import SchedulerMixin
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.utils import BaseOutput
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
 
 @dataclass

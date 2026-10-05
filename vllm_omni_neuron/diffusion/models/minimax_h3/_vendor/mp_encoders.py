@@ -16,12 +16,13 @@ import numpy as np
 import torch
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
-from ...models import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio
-from ...utils import logging
-from ..modular_pipeline import ModularPipelineBlocks, PipelineState
-from ..modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
-from .modular_pipeline import MiniMaxH3ModularPipeline
-from .references import MiniMaxH3Reference
+from .autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3
+from .autoencoder_kl_minimax_h3_audio import AutoencoderKLMiniMaxH3Audio
+from diffusers.utils import logging
+from diffusers.modular_pipelines.modular_pipeline import ModularPipelineBlocks, PipelineState
+from diffusers.modular_pipelines.modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
+from .mp_modular_pipeline import MiniMaxH3ModularPipeline
+from .mp_references import MiniMaxH3Reference
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name

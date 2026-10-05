@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...loaders import MiniMaxH3LoraLoaderMixin
-from ...utils import logging
-from ..modular_pipeline import ModularPipeline
+from ._compat import MiniMaxH3LoraLoaderMixin
+from diffusers.utils import logging
+from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
