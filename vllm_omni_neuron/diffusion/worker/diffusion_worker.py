@@ -18,6 +18,10 @@ from vllm_omni.platforms import current_omni_platform
 
 from vllm_omni_neuron.backend import uses_native_compilation_backend
 from vllm_omni_neuron.diffusion.distributed.parallel_state import override_groups_with_physical_mesh
+from vllm_omni_neuron.diffusion.worker.ccom_root import (
+    check_ccom_root_port_free,
+    set_ccom_root_comm_id,
+)
 from vllm_omni_neuron.lite_compat import initialize as initialize_lite
 from vllm_omni_neuron.lite_compat import is_lite_runtime
 
@@ -89,7 +93,15 @@ class NeuronDiffusionWorker(DiffusionWorker, NeuronWorker):
                 NeuronPlatform.set_device_count(len(visible_devices))
                 os.environ["NEURON_RT_VISIBLE_CORES"] = str(visible_devices[self.local_rank])
                 os.environ.pop("NEURON_LIBRARY_PATH", None)
-                os.environ.pop("NEURON_RT_ROOT_COMM_ID", None)
+                # CCOM bootstrap root: a deterministic host:port derived from this engine's
+                # cores, pinned BEFORE Lite initializes. This used to pop the variable, which
+                # made Lite's rank 0 probe-and-release an ephemeral port that another engine
+                # starting on the same host could take first: rank 0 then failed its first
+                # collective graph ("Failed to bind(127.0.0.1<port>) Address already in use"
+                # -> ncclInitGlobalComm failed -> Failed to schedule neff execution) and every
+                # other rank retried the bootstrap indefinitely. See worker/ccom_root.py.
+                self._ccom_root_comm_id = set_ccom_root_comm_id(visible_devices)
+                self._ccom_root_cores = list(visible_devices)
                 # Also sets TORCH_NEURONX_VOCAB_SHARDING_SPMD_DISABLE; see initialize().
                 initialize_lite()
 
@@ -117,6 +129,12 @@ class NeuronDiffusionWorker(DiffusionWorker, NeuronWorker):
 
             runtime = torch.classes.neuron.Runtime()
             runtime.initialize()
+
+        ccom_root = getattr(self, "_ccom_root_comm_id", None)
+        if ccom_root is not None:
+            # Gloo is up: all ranks learn together whether the root port is already taken, and
+            # fail here with the reason rather than at the first collective graph.
+            check_ccom_root_port_free(ccom_root, rank=self.rank, cores=self._ccom_root_cores)
 
         if not envs.VLLM_NEURON_CPU_MODE and (not native_compilation or lite_runtime):
             # torch_neuronx and Lite both patch F.gelu with a wrapper around the C

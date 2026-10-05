@@ -91,7 +91,9 @@ class NeuronOmniPlatform(OmniPlatform, NeuronPlatform):
     @classmethod
     def get_device_count(cls) -> int:
         if envs.VLLM_NEURON_CPU_MODE:
-            return 0
+            # One CPU "device": vllm-omni derives the local device id as rank % device_count,
+            # so 0 crashes CPU-mode (reference/oracle) runs with a ZeroDivisionError.
+            return 1
         if is_lite_runtime():
             return lite_device_count()
         return NeuronPlatform.device_count()

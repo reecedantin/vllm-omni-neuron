@@ -145,6 +145,13 @@ def mesh_tp_cp_cfg_groups(
     mesh does not apply (see :func:`_supports_physical_mesh`).
 
     Every returned partition covers ``range(tp*cp*cfg)`` exactly once.
+
+    Group lists are NOT necessarily sorted: on the physical mesh half of the CP groups (Layout A,
+    and Layout B with cfg=1) or of the CFG groups (Layout B with cfg>1) are descending, e.g. CP
+    ``[12, 8]`` at TP8 x CP2. Group rank (``rank_in_group``) and in-graph device collectives follow
+    the list order; the c10d groups built from these lists are sorted. Host collectives over a CP /
+    CFG ``cpu_group`` must therefore go through :func:`host_all_gather` /
+    :func:`host_all_gather_object` (or map positions themselves).
     """
     world = tp_size * cp_size * cfg_size
 
@@ -156,6 +163,51 @@ def mesh_tp_cp_cfg_groups(
 
     # _supports_physical_mesh gates this to validated platforms only (trn2 today).
     return _tp_contiguous_mesh_groups(tp_size, cp_size, cfg_size)
+
+
+def _c10d_positions(coord) -> list[int]:
+    """For each member of ``coord.ranks`` (group-rank order), its index in the c10d group.
+
+    ``torch.distributed.new_group`` sorts its ranks, so the ``cpu_group`` / ``device_group`` of a
+    coordinator built from an unsorted rank list (the physical-mesh CP / CFG groups, e.g.
+    ``[12, 8]``) orders its members ``[8, 12]``, while ``coord.rank_in_group`` -- which picks the CP
+    slice and the CFG branch -- follows the list. The two orders only agree for sorted lists."""
+    ranks = list(coord.ranks)
+    c10d = sorted(ranks)
+    return [c10d.index(r) for r in ranks]
+
+
+def host_all_gather(coord, tensor):
+    """All-gather a HOST tensor over ``coord.cpu_group``; returns the per-member parts in
+    ``coord.ranks`` order, i.e. ``parts[i]`` came from the member whose ``rank_in_group == i``.
+
+    Use this, not a raw ``dist.all_gather(parts, t, group=coord.cpu_group)``, for any host
+    collective over a CP or CFG group: on Trn2 physical-mesh layouts (TP8 x CP>=2, CP8 x TP*CFG8,
+    TP8 x CP x CFG2) some of those groups are descending (:func:`mesh_tp_cp_cfg_groups`), and the raw
+    call returns the parts in sorted (c10d) order -- swapped CP slices / CFG branches on exactly those
+    ranks. In-graph device collectives are unaffected: they lower to the registered replica groups,
+    which keep the list order. A single-member coordinator returns ``[tensor]``."""
+    import torch
+    import torch.distributed as dist
+
+    if coord.world_size == 1:
+        return [tensor]
+    tensor = tensor.contiguous()
+    parts = [torch.empty_like(tensor) for _ in range(coord.world_size)]
+    dist.all_gather(parts, tensor, group=coord.cpu_group)
+    return [parts[p] for p in _c10d_positions(coord)]
+
+
+def host_all_gather_object(coord, obj) -> list:
+    """``all_gather_object`` over ``coord.cpu_group``, results in ``coord.ranks`` order (see
+    :func:`host_all_gather`)."""
+    import torch.distributed as dist
+
+    if coord.world_size == 1:
+        return [obj]
+    out = [None] * coord.world_size
+    dist.all_gather_object(out, obj, group=coord.cpu_group)
+    return [out[p] for p in _c10d_positions(coord)]
 
 
 def get_replica_groups(
