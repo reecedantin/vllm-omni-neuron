@@ -1,0 +1,25 @@
+# GR00T N1.7 policy on Neuron (vLLM Omni). GR00T needs only one NeuronCore (TP=1) regardless
+# of hardware generation, so this default is identical to the trn2 variant
+# (`gr00t_stage_trn2.yaml`) and works unchanged on Inferentia2 / Trainium1 (just change
+# `devices:` to a core on that host). Kept as its own file so `--stage-config` examples and the
+# per-model-PR layout match the other models' `<pkg>_stage.yaml` default.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: actions
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Gr00tN1d7Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        embodiment_tag: OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+        # local Qwen3-VL-2B-Instruct processor directory (tokenizer + image processor);
+        # leave unset to use $GR00T_VLM_PROCESSOR, or the Hub id when online
+        # vlm_processor: /path/to/Qwen3-VL-2B-Instruct
+      parallel_config:
+        tensor_parallel_size: 1
