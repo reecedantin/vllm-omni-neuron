@@ -29,24 +29,67 @@ from vllm_omni_neuron.diffusion.models.gr00t.config import COSMOS_REASON2_2B
 
 TINY_BACKBONE = copy.deepcopy(COSMOS_REASON2_2B)
 TINY_BACKBONE["text_config"].update(
-    hidden_size=128, intermediate_size=256, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
-    num_hidden_layers=4, rope_scaling={"mrope_interleaved": True, "mrope_section": [6, 5, 5], "rope_type": "default"})
+    hidden_size=128,
+    intermediate_size=256,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=32,
+    num_hidden_layers=4,
+    rope_scaling={"mrope_interleaved": True, "mrope_section": [6, 5, 5], "rope_type": "default"},
+)
 TINY_BACKBONE["vision_config"].update(
-    hidden_size=64, intermediate_size=128, num_heads=4, depth=6, deepstack_visual_indexes=[1, 3, 5], out_hidden_size=128)
+    hidden_size=64,
+    intermediate_size=128,
+    num_heads=4,
+    depth=6,
+    deepstack_visual_indexes=[1, 3, 5],
+    out_hidden_size=128,
+)
 
 # real N1.7 config.json keys, shrunk
 TINY_HEAD = {
-    "architectures": ["Gr00tN1d7"], "model_type": "Gr00tN1d7", "model_name": "nvidia/Cosmos-Reason2-2B",
-    "action_horizon": 40, "add_pos_embed": True, "backbone_embedding_dim": 128, "hidden_size": 64,
-    "input_embedding_dim": 96, "max_action_dim": 132, "max_state_dim": 132, "max_num_embodiments": 32,
-    "max_seq_len": 1024, "num_inference_timesteps": 4, "num_timestep_buckets": 1000, "select_layer": 4,
-    "use_alternate_vl_dit": True, "use_vlln": True, "use_vl_self_attention": True, "load_bf16": False,
-    "state_history_length": 1, "attend_text_every_n_blocks": 2, "dtype": "bfloat16", "model_dtype": "bfloat16",
-    "diffusion_model_cfg": {"attention_head_dim": 24, "dropout": 0.2, "final_dropout": True,
-                            "interleave_self_attention": True, "norm_type": "ada_norm", "num_attention_heads": 4,
-                            "num_layers": 4, "output_dim": 64, "positional_embeddings": None},
-    "vl_self_attention_cfg": {"attention_head_dim": 32, "dropout": 0.2, "final_dropout": True,
-                              "num_attention_heads": 4, "num_layers": 2, "positional_embeddings": None},
+    "architectures": ["Gr00tN1d7"],
+    "model_type": "Gr00tN1d7",
+    "model_name": "nvidia/Cosmos-Reason2-2B",
+    "action_horizon": 40,
+    "add_pos_embed": True,
+    "backbone_embedding_dim": 128,
+    "hidden_size": 64,
+    "input_embedding_dim": 96,
+    "max_action_dim": 132,
+    "max_state_dim": 132,
+    "max_num_embodiments": 32,
+    "max_seq_len": 1024,
+    "num_inference_timesteps": 4,
+    "num_timestep_buckets": 1000,
+    "select_layer": 4,
+    "use_alternate_vl_dit": True,
+    "use_vlln": True,
+    "use_vl_self_attention": True,
+    "load_bf16": False,
+    "state_history_length": 1,
+    "attend_text_every_n_blocks": 2,
+    "dtype": "bfloat16",
+    "model_dtype": "bfloat16",
+    "diffusion_model_cfg": {
+        "attention_head_dim": 24,
+        "dropout": 0.2,
+        "final_dropout": True,
+        "interleave_self_attention": True,
+        "norm_type": "ada_norm",
+        "num_attention_heads": 4,
+        "num_layers": 4,
+        "output_dim": 64,
+        "positional_embeddings": None,
+    },
+    "vl_self_attention_cfg": {
+        "attention_head_dim": 32,
+        "dropout": 0.2,
+        "final_dropout": True,
+        "num_attention_heads": 4,
+        "num_layers": 2,
+        "positional_embeddings": None,
+    },
 }
 
 PROCESSOR_FILES = ("processor_config.json", "statistics.json", "embodiment_id.json")
@@ -55,8 +98,14 @@ PROCESSOR_FILES = ("processor_config.json", "statistics.json", "embodiment_id.js
 def tiny_head_config(variant: str = "n17") -> dict:
     cfg = copy.deepcopy(TINY_HEAD)
     if variant == "h":  # GR00T-H-N1.7: no VL self-attention, 50-step chunks (see docs)
-        cfg.update(action_horizon=50, use_vl_self_attention=False, vl_self_attention_cfg=None,
-                   state_dropout_prob=0.0, use_soft_prompts=False, soft_prompt_num_tokens=32)
+        cfg.update(
+            action_horizon=50,
+            use_vl_self_attention=False,
+            vl_self_attention_cfg=None,
+            state_dropout_prob=0.0,
+            use_soft_prompts=False,
+            soft_prompt_num_tokens=32,
+        )
     return cfg
 
 
@@ -72,7 +121,9 @@ def build_upstream_model(model_dir: str, head_cfg: dict):
     cfg = dict(head_cfg)
     cfg["model_name"] = os.path.join(model_dir, "nvidia", "Cosmos-Reason2-2B")
     cfg["load_bf16"] = False
-    conf = Gr00tN1d7Config(**{k: v for k, v in cfg.items() if k not in ("architectures", "model_type")})
+    conf = Gr00tN1d7Config(
+        **{k: v for k, v in cfg.items() if k not in ("architectures", "model_type")}
+    )
     orig = up.Gr00tN1d7DataCollator
     up.Gr00tN1d7DataCollator = lambda **kw: None
     try:
@@ -82,7 +133,9 @@ def build_upstream_model(model_dir: str, head_cfg: dict):
     return model.eval()
 
 
-def build_tiny_checkpoint(out: str, variant: str = "n17", seed: int = 0, processor_from: str | None = None) -> str:
+def build_tiny_checkpoint(
+    out: str, variant: str = "n17", seed: int = 0, processor_from: str | None = None
+) -> str:
     from safetensors.torch import save_file
 
     os.makedirs(out, exist_ok=True)
@@ -94,7 +147,9 @@ def build_tiny_checkpoint(out: str, variant: str = "n17", seed: int = 0, process
     hf_dir = os.path.join(out, "nvidia", "Cosmos-Reason2-2B")
     os.makedirs(hf_dir, exist_ok=True)
     with open(os.path.join(hf_dir, "config.json"), "w") as f:
-        json.dump({**TINY_BACKBONE, "architectures": ["Qwen3VLForConditionalGeneration"]}, f, indent=2)
+        json.dump(
+            {**TINY_BACKBONE, "architectures": ["Qwen3VLForConditionalGeneration"]}, f, indent=2
+        )
     torch.manual_seed(seed)
     model = build_upstream_model(out, head)
     with torch.no_grad():  # layer norms init to 1/0; perturb so they are exercised
@@ -103,7 +158,9 @@ def build_tiny_checkpoint(out: str, variant: str = "n17", seed: int = 0, process
                 p.add_(0.1 * torch.randn_like(p))
     sd = {k: v.detach().to(torch.bfloat16).contiguous() for k, v in model.state_dict().items()}
     # upstream drops lm_head; real checkpoints carry it (tied to embed_tokens)
-    sd["backbone.model.lm_head.weight"] = sd["backbone.model.model.language_model.embed_tokens.weight"].clone()
+    sd["backbone.model.lm_head.weight"] = sd[
+        "backbone.model.model.language_model.embed_tokens.weight"
+    ].clone()
     if variant == "h":
         sd["action_head.dropout_prob_by_embodiment"] = torch.zeros(32, dtype=torch.bfloat16)
     save_file(sd, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
@@ -120,8 +177,13 @@ def build_tiny_checkpoint(out: str, variant: str = "n17", seed: int = 0, process
 # ----------------------------------------------------------------------------------------
 
 
-def synthetic_inputs(n_images: int = 4, grid: int | tuple[int, int] = 16, n_text: int = 24, seed: int = 0,
-                     embodiment: int = 17):
+def synthetic_inputs(
+    n_images: int = 4,
+    grid: int | tuple[int, int] = 16,
+    n_text: int = 24,
+    seed: int = 0,
+    embodiment: int = 17,
+):
     """input_ids like ``<im_start>user\\n (<vs> <img>*(gh*gw/4) <ve>)*n  text <im_end>\\n``."""
     g = torch.Generator().manual_seed(seed)
     bb = COSMOS_REASON2_2B
@@ -129,7 +191,11 @@ def synthetic_inputs(n_images: int = 4, grid: int | tuple[int, int] = 16, n_text
     per_img = (gh // 2) * (gw // 2)
     ids = [151644, 872, 198]
     for _ in range(n_images):
-        ids += [bb["vision_start_token_id"]] + [bb["image_token_id"]] * per_img + [bb["vision_end_token_id"]]
+        ids += (
+            [bb["vision_start_token_id"]]
+            + [bb["image_token_id"]] * per_img
+            + [bb["vision_end_token_id"]]
+        )
     ids += torch.randint(1000, 100000, (n_text,), generator=g).tolist() + [151645, 198]
     input_ids = torch.tensor([ids])
     mm = (input_ids == bb["image_token_id"]).long()
@@ -161,7 +227,9 @@ def upstream_get_action(model, inputs: dict, noise: torch.Tensor) -> torch.Tenso
     try:
         with torch.no_grad():
             backbone_out = model.backbone(BatchFeature(data=dict(batch)))
-            features = backbone_out["backbone_features"].clone()  # get_action overwrites it with vlln(...)
+            features = backbone_out[
+                "backbone_features"
+            ].clone()  # get_action overwrites it with vlln(...)
             out = model.action_head.get_action(backbone_out, BatchFeature(data=dict(batch)))
     finally:
         up.torch.randn = real_randn
@@ -204,8 +272,11 @@ def test_tiny_cpu_parity_vs_upstream(tiny):
     variant, path = tiny
     ref = build_upstream_model(path, tiny_head_config(variant))
     sd = load_file(os.path.join(path, "model.safetensors"))
-    sd = {k: v.float() for k, v in sd.items() if k not in ("backbone.model.lm_head.weight",
-                                                             "action_head.dropout_prob_by_embodiment")}
+    sd = {
+        k: v.float()
+        for k, v in sd.items()
+        if k not in ("backbone.model.lm_head.weight", "action_head.dropout_prob_by_embodiment")
+    }
     ref.load_state_dict(sd, strict=True)
     mine = NeuronGr00tModel.from_pretrained(path, dtype=torch.float32)
     inputs = synthetic_inputs()
@@ -266,7 +337,10 @@ def test_tiny_repeated_prompt_reuses_tables(tiny):
     fresh = NeuronGr00tModel.from_pretrained(path, dtype=torch.float32)
     assert torch.equal(a0, m.get_action(x0, noise=noise)["action_pred"])
     assert torch.equal(a1, fresh.get_action(x1, noise=noise)["action_pred"])
-    assert torch.equal(again, fresh.get_action({**x0, "pixel_values": x1["pixel_values"]}, noise=noise)["action_pred"])
+    assert torch.equal(
+        again,
+        fresh.get_action({**x0, "pixel_values": x1["pixel_values"]}, noise=noise)["action_pred"],
+    )
 
 
 def test_tiny_fused_qkv_matches(tiny, monkeypatch):
@@ -302,6 +376,41 @@ def test_tiny_pretransposed_weights_match(tiny, monkeypatch):
     assert isinstance(p.head.model.proj_out_2, PretransposedLinear)
     assert isinstance(p.text.layers[0].mlp.down_proj, PretransposedLinear)
     assert _rel(p.get_action(inputs, noise=noise)["action_pred"], want) < 1e-6
+    from vllm_omni_neuron.diffusion.models.gr00t.layers import pretranspose_status
+
+    assert pretranspose_status(m.head)[0] == 0
+    good, total = pretranspose_status(p.head)
+    assert good == total > 0
+    p.head.model.proj_out_2.weight_t = p.head.model.proj_out_2.weight_t + 1  # stale copy is caught
+    assert pretranspose_status(p.head)[0] == total - 1
+
+
+def test_rank_report(tiny, tmp_path, monkeypatch):
+    """``$GR00T_RANK_REPORT``: a layout file per rank, then one shared-helper digest per request;
+    two ranks with the same actions agree, a drifting rank is caught."""
+    import json
+
+    from vllm_omni_neuron.diffusion.models.gr00t.model import NeuronGr00tModel
+    from vllm_omni_neuron.diffusion.models.gr00t.pipeline_gr00t import _rank_layout, _RankReport
+    from vllm_omni_neuron.testing import compare_rank_digest_files
+
+    _, path = tiny
+    m = NeuronGr00tModel.from_pretrained(path, dtype=torch.float32)
+    info = _rank_layout(m, 0, 2, True)
+    assert info["sharded"] == "head + backbone"
+    assert all(p["pretransposed"] == p["linears"] > 0 for p in info["parts"].values())
+    monkeypatch.setenv("GR00T_RANK_REPORT", str(tmp_path / "r"))
+    r0, r1 = _RankReport.from_env(info), _RankReport.from_env({**info, "rank": 1})
+    a = torch.randn(1, 4, 3)
+    for rep in (r0, r1):
+        rep.request(a)
+    r0.request(a)
+    r1.request(a + 1e-3)
+    assert json.load(open(tmp_path / "r" / "layout_1.json"))["rank"] == 1
+    assert compare_rank_digest_files(str(tmp_path / "r" / "req0000"), world_size=2).ok
+    assert compare_rank_digest_files(
+        str(tmp_path / "r" / "req0001"), world_size=2
+    ).disagreeing_ranks == [1]
 
 
 def _tp_worker(rank, world, port, path, out, backbone=False):
@@ -311,13 +420,20 @@ def _tp_worker(rank, world, port, path, out, backbone=False):
 
     if backbone:  # also exercise shard_linear refreshing the pretransposed weight copies
         os.environ["GR00T_PRETRANSPOSE"] = "all"
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
+    )
     try:
         m = NeuronGr00tModel.from_pretrained(path, dtype=torch.float32)
         m.head.shard_tp(rank, world, dist.group.WORLD)
         if backbone:
             m.vision.shard_tp(rank, world, dist.group.WORLD)
             m.text.shard_tp(rank, world, dist.group.WORLD)
+            from vllm_omni_neuron.diffusion.models.gr00t.layers import pretranspose_status
+
+            for part in (m.vision, m.text, m.head):  # every sharded copy is in step with its shard
+                good, total = pretranspose_status(part)
+                assert good == total > 0, (rank, good, total)
         noise = m.draw_noise(1, torch.Generator().manual_seed(5), dtype=torch.float32)
         act = m.get_action(synthetic_inputs(), noise=noise)["action_pred"]
         torch.save(act, f"{out}.{rank}")
@@ -353,7 +469,11 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     ap.add_argument("--variant", choices=["n17", "h"], default="n17")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--processor-from", default=None, help="copy processor/statistics JSONs from a real checkpoint")
+    ap.add_argument(
+        "--processor-from",
+        default=None,
+        help="copy processor/statistics JSONs from a real checkpoint",
+    )
     a = ap.parse_args()
     print(build_tiny_checkpoint(a.out, a.variant, a.seed, a.processor_from))
     sys.exit(0)

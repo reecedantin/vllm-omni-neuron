@@ -1,7 +1,8 @@
 # GR00T N1.7 lowest-latency layout on AWS Trainium2: all four NeuronCores of one chip (LNC=2), with the
 # flow-matching action head AND the VLM backbone (vision tower + text decoder) tensor-parallel over them.
-# Measured on the LIBERO benchmark setup (2 views, 4 steps, BF16): 33.0 ms per request (data processing +
-# backbone + action head) vs 51.0 ms on one core. For throughput, run one TP=1 replica per core instead.
+# Measured on the LIBERO benchmark setup (2 views, 4 steps, BF16): 31.9 ms per request (data processing +
+# backbone + action head; 41.3 ms client wall) vs 52.6 ms on one core. For throughput, run one TP=1
+# replica per core instead.
 stage_args:
   - stage_id: 0
     stage_type: diffusion

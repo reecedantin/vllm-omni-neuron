@@ -28,7 +28,10 @@ args = ap.parse_args()
 
 from vllm_neuron.envs import get_compile_backend_name  # noqa: E402
 
-from vllm_omni_neuron.diffusion.models.gr00t.model import NeuronGr00tModel, pick_bucket  # noqa: E402
+from vllm_omni_neuron.diffusion.models.gr00t.model import (  # noqa: E402
+    NeuronGr00tModel,
+    pick_bucket,
+)
 
 ref = torch.load(args.reference, weights_only=False)
 inputs, noise = ref["inputs"], ref["noise"]
@@ -38,8 +41,14 @@ m.compile(backend=get_compile_backend_name())
 dt = torch.bfloat16
 bucket = pick_bucket(int(inputs["attention_mask"].sum()))
 t0 = time.perf_counter()
-bi = m.prep(inputs["input_ids"], inputs["attention_mask"], inputs["pixel_values"], inputs["image_grid_thw"],
-            inputs.get("mm_token_type_ids"), bucket=bucket)
+bi = m.prep(
+    inputs["input_ids"],
+    inputs["attention_mask"],
+    inputs["pixel_values"],
+    inputs["image_grid_thw"],
+    inputs.get("mm_token_type_ids"),
+    bucket=bucket,
+)
 prep_cold_ms = 1000 * (time.perf_counter() - t0)
 
 
@@ -47,11 +56,29 @@ def d(x, dtype=None):
     return (x.to(dtype) if dtype is not None else x).contiguous().to(dev)
 
 
-vis_in = (d(bi.pixels, dt), d(bi.pos_index), d(bi.pos_weight, torch.float32), d(bi.vis_cos, torch.float32),
-          d(bi.vis_sin, torch.float32), bi.n_images)
-txt_in = (d(bi.input_ids), d(bi.image_index), d(bi.image_keep), d(bi.txt_cos, dt), d(bi.txt_sin, dt), d(bi.txt_bias))
-head_in = (d(bi.valid), d(bi.image_mask), d(inputs["state"], dt), d(noise, dt),
-           d(inputs["embodiment_id"].long().reshape(-1)))
+vis_in = (
+    d(bi.pixels, dt),
+    d(bi.pos_index),
+    d(bi.pos_weight, torch.float32),
+    d(bi.vis_cos, torch.float32),
+    d(bi.vis_sin, torch.float32),
+    bi.n_images,
+)
+txt_in = (
+    d(bi.input_ids),
+    d(bi.image_index),
+    d(bi.image_keep),
+    d(bi.txt_cos, dt),
+    d(bi.txt_sin, dt),
+    d(bi.txt_bias),
+)
+head_in = (
+    d(bi.valid),
+    d(bi.image_mask),
+    d(inputs["state"], dt),
+    d(noise, dt),
+    d(inputs["embodiment_id"].long().reshape(-1)),
+)
 H = m._fn("head")
 if m.fused_backbone:
     B = m._fn("backbone")
@@ -100,16 +127,26 @@ with torch.no_grad():
     res["head_ms"] = timed(lambda: H(hid, *head_in), args.iters)
     res["total_ms"] = timed(lambda: run()[1], args.iters)
     m.get_action(inputs, noise=noise)  # warms the host/device table caches
-    res["get_action_ms"] = timed(lambda: m.get_action(inputs, noise=noise)["action_pred"], args.iters)
+    res["get_action_ms"] = timed(
+        lambda: m.get_action(inputs, noise=noise)["action_pred"], args.iters
+    )
     res["get_action_prep_ms"] = round(1000 * m.stats["prep_s"], 2)
     act = m.get_action(inputs, noise=noise)["action_pred"]
 a, r = act.float(), ref["action_pred"].float()
-summary = {"tag": args.tag, "fused_backbone": m.fused_backbone, "n_images": bi.n_images,
-           "adaln_tables": os.environ.get("GR00T_ADALN_TABLES", "1"), "first_s": round(first_s, 1),
-           "prep_cold_ms": round(prep_cold_ms, 2), **res,
-           "vs_upstream_rel": round(((a - r).norm() / r.norm()).item(), 5),
-           "vs_upstream_cos": round(torch.nn.functional.cosine_similarity(a.flatten(), r.flatten(), dim=0).item(), 6),
-           "vs_upstream_mse": float(f"{((a - r) ** 2).mean().item():.3e}")}
+summary = {
+    "tag": args.tag,
+    "fused_backbone": m.fused_backbone,
+    "n_images": bi.n_images,
+    "adaln_tables": os.environ.get("GR00T_ADALN_TABLES", "1"),
+    "first_s": round(first_s, 1),
+    "prep_cold_ms": round(prep_cold_ms, 2),
+    **res,
+    "vs_upstream_rel": round(((a - r).norm() / r.norm()).item(), 5),
+    "vs_upstream_cos": round(
+        torch.nn.functional.cosine_similarity(a.flatten(), r.flatten(), dim=0).item(), 6
+    ),
+    "vs_upstream_mse": float(f"{((a - r) ** 2).mean().item():.3e}"),
+}
 print(json.dumps(summary))
 if args.out:
     os.makedirs(args.out, exist_ok=True)

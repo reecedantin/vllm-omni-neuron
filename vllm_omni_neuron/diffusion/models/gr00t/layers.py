@@ -31,8 +31,14 @@ def bias_from_keep(keep: torch.Tensor) -> torch.Tensor:
     return torch.where(keep, 0.0, MASK_VALUE).to(torch.float32)
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor | None = None,
-              scale: float | None = None, allow_nki: bool = False) -> torch.Tensor:
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    scale: float | None = None,
+    allow_nki: bool = False,
+) -> torch.Tensor:
     """q ``[B, H, Sq, D]``, k/v ``[B, Hk, Sk, D]`` (``H % Hk == 0``) -> ``[B, H, Sq, D]``.
 
     ``allow_nki``: unmasked call sites may use the plugin's NKI flash-attention kernel
@@ -91,6 +97,24 @@ def pretranspose_linears(module: nn.Module) -> int:
     return n
 
 
+def pretranspose_status(module: nn.Module) -> tuple[int, int]:
+    """(linears whose matmul reads a ``weight_t`` in step with their current, possibly sharded,
+    weight; all linears) under ``module``. A layout check for logs and per-rank reports; call it on
+    the host, before ``.to(device)``."""
+    good = total = 0
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            total += 1
+            w_t = getattr(m, "weight_t", None)
+            good += int(
+                isinstance(m, PretransposedLinear)
+                and w_t is not None
+                and w_t.shape == m.weight.shape[::-1]
+                and torch.equal(w_t[:, 0], m.weight[0])
+            )
+    return good, total
+
+
 def shard_linear(lin: nn.Linear, dim: int, rank: int, size: int, parts: int = 1) -> None:
     """Keep this rank's slice of ``lin`` (``dim`` 0: output rows + bias; 1: input columns).
 
@@ -101,14 +125,18 @@ def shard_linear(lin: nn.Linear, dim: int, rank: int, size: int, parts: int = 1)
     if dim == 0:
         blk = w.shape[0] // parts
         n = blk // size
-        idx = torch.cat([torch.arange(p * blk + rank * n, p * blk + (rank + 1) * n) for p in range(parts)])
+        idx = torch.cat(
+            [torch.arange(p * blk + rank * n, p * blk + (rank + 1) * n) for p in range(parts)]
+        )
         lin.weight = nn.Parameter(w.index_select(0, idx).contiguous(), requires_grad=False)
         if b is not None:
             lin.bias = nn.Parameter(b.index_select(0, idx).contiguous(), requires_grad=False)
     else:
         n = w.shape[1] // size
         lin.weight = nn.Parameter(w.narrow(1, rank * n, n).contiguous(), requires_grad=False)
-    if getattr(lin, "weight_t", None) is not None:  # keep a pretransposed copy in step with the shard
+    if (
+        getattr(lin, "weight_t", None) is not None
+    ):  # keep a pretransposed copy in step with the shard
         lin.register_buffer("weight_t", lin.weight.detach().t().contiguous(), persistent=False)
 
 
@@ -120,7 +148,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 

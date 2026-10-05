@@ -1,7 +1,7 @@
-# GR00T N1.7 low-latency alternative on AWS Trainium2: the flow-matching action head (32 DiT layers x
+# GR00T N1.7 middle-ground layout on AWS Trainium2: the flow-matching action head (32 DiT layers x
 # 4 unrolled Euler steps, weight-streaming bound) is tensor-parallel over two NeuronCores of one chip;
-# the vision tower and text decoder stay replicated. Measured on trn2 (LNC=2): 60.0 ms served warm vs
-# 67.8 ms for gr00t_stage_trn2.yaml (TP=1). For throughput, run one TP=1 replica per core instead.
+# the vision tower and text decoder stay replicated. Measured on trn2 (LNC=2), DROID input: 55.7 ms per
+# request vs 61.7 ms for gr00t_stage_trn2.yaml (TP=1) and 40.6 ms for gr00t_stage_trn2_tp4.yaml (TP=4).
 stage_args:
   - stage_id: 0
     stage_type: diffusion

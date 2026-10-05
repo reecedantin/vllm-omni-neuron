@@ -10,7 +10,9 @@ import pytest
 @pytest.mark.parametrize("seed", range(5))
 def test_eef_rot6d_to_absolute_matches_upstream(seed):
     pytest.importorskip("vllm_omni.diffusion.models.gr00t.dataio.state_action.action_chunking")
-    from vllm_omni.diffusion.models.gr00t.dataio.state_action.action_chunking import EndEffectorActionChunk
+    from vllm_omni.diffusion.models.gr00t.dataio.state_action.action_chunking import (
+        EndEffectorActionChunk,
+    )
     from vllm_omni.diffusion.models.gr00t.dataio.state_action.pose import EndEffectorPose
     from vllm_omni.diffusion.models.gr00t.dataio.types import ActionFormat
 
@@ -20,8 +22,11 @@ def test_eef_rot6d_to_absolute_matches_upstream(seed):
     action = rng.normal(size=(40, 9)).astype(np.float32)
     state = rng.normal(size=9).astype(np.float32)
     fmt = ActionFormat.XYZ_ROT6D
-    want = EndEffectorActionChunk.from_array(action, fmt).to_absolute_chunking(
-        EndEffectorPose.from_action_format(state, fmt)).to(fmt)
+    want = (
+        EndEffectorActionChunk.from_array(action, fmt)
+        .to_absolute_chunking(EndEffectorPose.from_action_format(state, fmt))
+        .to(fmt)
+    )
     got = eef_rot6d_to_absolute(action, state)
     assert got.shape == want.shape
     np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)  # float32 inputs: a few ulp at most

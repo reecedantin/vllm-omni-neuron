@@ -17,6 +17,7 @@ architecture itself is resolved by :mod:`.config` without the Hub.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import time
@@ -24,7 +25,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
 from vllm_omni.diffusion.models.gr00t import policy as _up_policy
 from vllm_omni.diffusion.models.gr00t.modeling import processing_gr00t_n1d7 as _up_processing
 from vllm_omni.diffusion.models.gr00t.pipeline_gr00t import Gr00tN1d7Pipeline
@@ -54,7 +54,9 @@ class _PolicyModelAdapter:
         self.model = model
         self.config = model.cfg
         self.generator: torch.Generator | None = None  # set per request by the pipeline
-        self.noise: torch.Tensor | None = None  # explicit initial noise for parity checks (per request)
+        self.noise: torch.Tensor | None = (
+            None  # explicit initial noise for parity checks (per request)
+        )
         self.last_pred: torch.Tensor | None = None  # normalized action_pred of the last call
         self.t_enter = self.t_exit = 0.0  # model call boundaries (per-stage timing)
 
@@ -105,12 +107,17 @@ class NeuronGr00tN1d7Pipeline(Gr00tN1d7Pipeline):
         model_config = od_config.model_config or {}
         model = NeuronGr00tModel.from_pretrained(od_config.model, dtype=torch.bfloat16)
         tp_size, tp_rank, tp_group = _tp_state()
-        tp_backbone = bool(model_config.get("tp_backbone", os.environ.get("GR00T_TP_BACKBONE", "0") == "1"))
+        tp_backbone = bool(
+            model_config.get("tp_backbone", os.environ.get("GR00T_TP_BACKBONE", "0") == "1")
+        )
         if tp_size > 1:  # action head always; vision tower + text decoder too with tp_backbone
             model.head.shard_tp(tp_rank, tp_size, tp_group)
             if tp_backbone:
                 model.vision.shard_tp(tp_rank, tp_size, tp_group)
                 model.text.shard_tp(tp_rank, tp_size, tp_group)
+        self._rank_info = _rank_layout(model, tp_rank, tp_size, tp_backbone)
+        logger.info("GR00T rank %d/%d layout: %s", tp_rank, tp_size, self._rank_info["layout"])
+        self._rank_report = _RankReport.from_env(self._rank_info)
         vlm = model_config.get("vlm_processor") or os.environ.get("GR00T_VLM_PROCESSOR")
         if vlm and not Path(vlm).is_dir():
             raise FileNotFoundError(f"vlm_processor {vlm!r} is not a directory")
@@ -123,9 +130,15 @@ class NeuronGr00tN1d7Pipeline(Gr00tN1d7Pipeline):
         object.__setattr__(self, "_model", model)
         self.device = "cpu"  # host-side generator/seed device; the model graphs live on Neuron
         self._adapter: _PolicyModelAdapter = self.policy.model
-        logger.info("GR00T on Neuron: %s, embodiment=%s, horizon=%d, TP=%d (backbone %s), host threads=%d",
-                    od_config.model, self.embodiment_tag, self._model.head.action_horizon, tp_size,
-                    "sharded" if tp_size > 1 and tp_backbone else "replicated", self._host_threads)
+        logger.info(
+            "GR00T on Neuron: %s, embodiment=%s, horizon=%d, TP=%d (backbone %s), host threads=%d",
+            od_config.model,
+            self.embodiment_tag,
+            self._model.head.action_horizon,
+            tp_size,
+            "sharded" if tp_size > 1 and tp_backbone else "replicated",
+            self._host_threads,
+        )
 
     # -- engine hooks --------------------------------------------------------------------
     def to(self, *args, **kwargs):
@@ -137,7 +150,9 @@ class NeuronGr00tN1d7Pipeline(Gr00tN1d7Pipeline):
             from vllm_neuron.envs import get_compile_backend_name
 
             backend = get_compile_backend_name()
-        self._model.compile(backend, options, **{k: v for k, v in kwargs.items() if k == "fullgraph"})
+        self._model.compile(
+            backend, options, **{k: v for k, v in kwargs.items() if k == "fullgraph"}
+        )
         return self
 
     @torch.inference_mode()
@@ -153,20 +168,29 @@ class NeuronGr00tN1d7Pipeline(Gr00tN1d7Pipeline):
             with torch_threads(self._host_threads):
                 out = super().forward(req, **kwargs)
             t_end = time.perf_counter()
-            if extra.get("return_action_pred") and self._adapter.last_pred is not None and out.output:
+            if (
+                extra.get("return_action_pred")
+                and self._adapter.last_pred is not None
+                and out.output
+            ):
                 # parity checks: the normalized model output, before action decoding
                 out.output["actions"]["action_pred"] = self._adapter.last_pred.float().numpy()
             if extra.get("return_timing") and out.output:
                 out.output["actions"]["timing_ms"] = self._timing_ms(t0, t_end)
+            if self._rank_report is not None and self._adapter.last_pred is not None:
+                self._rank_report.request(self._adapter.last_pred)
             return out
         finally:
             self._adapter.generator = self._adapter.noise = self._adapter.last_pred = None
             st = self._model.stats
             if "device_s" in st:
                 st["request_s"] = time.perf_counter() - t0
-                logger.debug("GR00T request %.1f ms (model prep %.1f, device %.1f)", 1e3 * st["request_s"],
-                             1e3 * st["prep_s"], 1e3 * st["device_s"])
-
+                logger.debug(
+                    "GR00T request %.1f ms (model prep %.1f, device %.1f)",
+                    1e3 * st["request_s"],
+                    1e3 * st["prep_s"],
+                    1e3 * st["device_s"],
+                )
 
     def _timing_ms(self, t0: float, t_end: float):
         """Per-request stages in ms, in NVIDIA's deployment-benchmark split: [data processing (processor +
@@ -180,7 +204,9 @@ class NeuronGr00tN1d7Pipeline(Gr00tN1d7Pipeline):
             bb, head = st["backbone_s"], st["head_s"]
         else:
             bb, head = a.t_exit - a.t_enter, 0.0
-        return 1e3 * np.array([a.t_enter - t0, bb, head, t_end - a.t_exit, t_end - t0], dtype=np.float32)
+        return 1e3 * np.array(
+            [a.t_enter - t0, bb, head, t_end - a.t_exit, t_end - t0], dtype=np.float32
+        )
 
 
 def _as_tensor(v) -> torch.Tensor | None:
@@ -190,7 +216,9 @@ def _as_tensor(v) -> torch.Tensor | None:
     import numpy as np
 
     if isinstance(v, dict) and "data" in v:
-        return torch.from_numpy(np.frombuffer(v["data"], dtype=np.float32).reshape(v["shape"]).copy())
+        return torch.from_numpy(
+            np.frombuffer(v["data"], dtype=np.float32).reshape(v["shape"]).copy()
+        )
     return torch.as_tensor(np.asarray(v, dtype=np.float32))
 
 
@@ -200,7 +228,10 @@ def _tp_state() -> tuple[int, int, object]:
     Under TP>1 the group's partition is registered with the Neuron compiler's mesh registry so the
     in-graph all-reduces legalize (``register_replica_groups``)."""
     try:
-        from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
         from vllm.distributed.parallel_state import get_tp_group
 
         size = get_tensor_model_parallel_world_size()
@@ -212,6 +243,54 @@ def _tp_state() -> tuple[int, int, object]:
 
         register_replica_groups(tp_size=size, cp_size=1)
     return size, rank, group
+
+
+def _rank_layout(model: NeuronGr00tModel, rank: int, size: int, tp_backbone: bool) -> dict:
+    """This rank's weight layout, read off the model after any TP sharding (on the host)."""
+    from .layers import pretranspose_status
+
+    parts = {}
+    for name in ("vision", "text", "head"):
+        good, total = pretranspose_status(getattr(model, name))
+        parts[name] = {"pretransposed": good, "linears": total}
+    layout = ", ".join(
+        f"{n} {p['pretransposed']}/{p['linears']} linears pretransposed" for n, p in parts.items()
+    )
+    sharded = "head + backbone" if size > 1 and tp_backbone else ("head" if size > 1 else "none")
+    return {
+        "rank": rank,
+        "tp_size": size,
+        "sharded": sharded,
+        "parts": parts,
+        "layout": f"TP shards: {sharded}; {layout}",
+    }
+
+
+class _RankReport:
+    """Per-rank evidence for TP checks (``$GR00T_RANK_REPORT`` = a directory): every rank writes
+    ``layout_<r>.json`` (its pretransposed/total linears per part after sharding), then for each
+    request ``req<i>/rank_digest_<r>.json`` -- the shared :func:`write_rank_digest` digest of the
+    normalized action chunk it computed. The gate compares them with
+    :func:`compare_rank_digest_files`."""
+
+    def __init__(self, root: Path, info: dict):
+        self.root, self.rank, self.n = root, info["rank"], 0
+        with open(root / f"layout_{self.rank}.json", "w") as f:
+            json.dump({k: v for k, v in info.items() if k != "layout"}, f)
+
+    @classmethod
+    def from_env(cls, info: dict) -> _RankReport | None:
+        d = os.environ.get("GR00T_RANK_REPORT")
+        if not d:
+            return None
+        Path(d).mkdir(parents=True, exist_ok=True)
+        return cls(Path(d), info)
+
+    def request(self, pred: torch.Tensor) -> None:
+        from vllm_omni_neuron.testing import write_rank_digest
+
+        write_rank_digest(str(self.root / f"req{self.n:04d}"), self.rank, {"action_pred": pred})
+        self.n += 1
 
 
 def _request_generator(sampling_params) -> torch.Generator | None:

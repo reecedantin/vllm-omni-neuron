@@ -31,7 +31,9 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-    return torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
 
 
 pytestmark = pytest.mark.skipif(
@@ -76,16 +78,24 @@ def test_device_parity_and_adaln_bit_identity():
         for step, t in enumerate(m.head.timesteps()):
             temb = dit.temb(torch.full((1,), t, dtype=torch.long, device=dev)).to("cpu")
             for i, blk in enumerate(dit.transformer_blocks):
-                live = blk.norm1.linear.to("cpu")(torch.nn.functional.silu(temb))[0]
                 baked = m.head.adaln_table[step, i].to("cpu")
                 x = torch.nn.functional.silu(temb.float()).to(torch.bfloat16).float()
-                ref = ((x @ blk.norm1.linear.weight.to("cpu").to(torch.bfloat16).float().t()).to(torch.bfloat16)
-                      + blk.norm1.linear.bias.to("cpu").to(torch.bfloat16))[0]
+                ref = (
+                    (x @ blk.norm1.linear.weight.to("cpu").to(torch.bfloat16).float().t()).to(
+                        torch.bfloat16
+                    )
+                    + blk.norm1.linear.bias.to("cpu").to(torch.bfloat16)
+                )[0]
                 mismatches += int(not torch.equal(baked, ref))
 
     ref32, ref16 = refs[torch.float32], refs[torch.bfloat16]
-    report = {"rel_dev": _rel(out, ref32), "rel_cpu_bf16": _rel(ref16, ref32), "cos_dev": _cos(out, ref32),
-              "deterministic": bool(torch.equal(out, out2)), "adaln_table_mismatches": mismatches}
+    report = {
+        "rel_dev": _rel(out, ref32),
+        "rel_cpu_bf16": _rel(ref16, ref32),
+        "cos_dev": _cos(out, ref32),
+        "deterministic": bool(torch.equal(out, out2)),
+        "adaln_table_mismatches": mismatches,
+    }
     out_dir = os.environ.get("GR00T_TEST_OUT")
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

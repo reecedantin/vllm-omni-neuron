@@ -15,26 +15,35 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
 WEIGHTS = os.environ.get("GR00T_WEIGHTS", "")
 VLM = os.environ.get("GR00T_VLM_PROCESSOR", "")
 HF_ROOT = os.environ.get("GR00T_HF_ROOT", "")
 TAG = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"
 
-pytestmark = pytest.mark.skipif(not (os.path.isdir(WEIGHTS) and os.path.isdir(VLM)),
-                                reason="set GR00T_WEIGHTS and GR00T_VLM_PROCESSOR")
+pytestmark = pytest.mark.skipif(
+    not (os.path.isdir(WEIGHTS) and os.path.isdir(VLM)),
+    reason="set GR00T_WEIGHTS and GR00T_VLM_PROCESSOR",
+)
 
 
 def make_obs(seed: int = 0) -> dict:
     rng = np.random.default_rng(seed)
     return {
-        "video": {k: rng.integers(0, 255, (1, 2, 180, 320, 3), dtype=np.uint8)
-                  for k in ("exterior_image_1_left", "wrist_image_left")},
-        "state": {"eef_9d": (rng.normal(size=(1, 1, 9)) * 0.1).astype(np.float32),
-                  "gripper_position": rng.uniform(size=(1, 1, 1)).astype(np.float32),
-                  "joint_position": (rng.normal(size=(1, 1, 7)) * 0.3).astype(np.float32)},
-        "language": {"annotation.language.language_instruction": [["pick up the red cube and put it in the bowl"]]},
+        "video": {
+            k: rng.integers(0, 255, (1, 2, 180, 320, 3), dtype=np.uint8)
+            for k in ("exterior_image_1_left", "wrist_image_left")
+        },
+        "state": {
+            "eef_9d": (rng.normal(size=(1, 1, 9)) * 0.1).astype(np.float32),
+            "gripper_position": rng.uniform(size=(1, 1, 1)).astype(np.float32),
+            "joint_position": (rng.normal(size=(1, 1, 7)) * 0.3).astype(np.float32),
+        },
+        "language": {
+            "annotation.language.language_instruction": [
+                ["pick up the red cube and put it in the bowl"]
+            ]
+        },
     }
 
 

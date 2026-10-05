@@ -4,7 +4,7 @@
 policy) on AWS Inferentia2 / Trainium with the vLLM Omni Neuron plugin: environment, model download, stage
 configuration, offline and online inference, the GR00T-H variant, and troubleshooting. -->
 <!-- meta: keywords: GR00T, GR00T N1.7, tutorial, vLLM Omni, Neuron, inf2, trn2, robot policy, VLA -->
-<!-- meta: date_updated: 2026-10-03 -->
+<!-- meta: date_updated: 2026-10-05 -->
 <!-- meta: content_type: tutorial -->
 
 You will serve NVIDIA's GR00T N1.7-3B robot policy on one NeuronCore and get a 40-step action chunk from a
@@ -50,12 +50,16 @@ stage_args:
         tensor_parallel_size: 1
 ```
 
-GR00T needs no parallelism: `tensor_parallel_size: 1`, one core. `devices:` picks which NeuronCore the
+GR00T needs no parallelism to fit: `tensor_parallel_size: 1`, one core, is the throughput configuration (one
+replica per core). `devices:` picks which NeuronCore the
 engine uses — change it if core 0 is in use by something else on the host. `embodiment_tag` must match a
 tag the checkpoint's processor config declares (see `nvidia/GR00T-N1.7-3B`'s `processor_config.json` for
 the full list); it decides which state/action keys the model expects and how they are normalized.
-`gr00t_stage.yaml` (no hardware suffix) is identical — GR00T needs no per-generation tuning, so there is
-only one recommended configuration.
+`gr00t_stage.yaml` (no hardware suffix) is identical — GR00T needs no per-generation tuning. For the lowest
+latency per request, use `gr00t_stage_trn2_tp4.yaml` instead: all four cores of one trn2 chip, with the
+action head and the backbone tensor-parallel (`tensor_parallel_size: 4`, `tp_backbone: true`; 40.6 ms vs
+61.7 ms per DROID request on one core, see the
+[model card](../models/gr00t-n17.md#recommended-configuration)).
 
 ## Step 4: Run inference
 
@@ -99,14 +103,15 @@ comparison and what is and is not ported.
 | `GatedRepoError` downloading the backbone | `nvidia/GR00T-N1.7-3B` is gated | Request access, then `hf auth login` / `HF_TOKEN` |
 | `NEURON_RT_VISIBLE_CORES cannot be used with multi-processing execution on vLLM` | vLLM Omni manages core assignment itself | Remove the env var; use the stage config's `devices:` field |
 | `ModalityConfig.__init__() got an unexpected keyword argument 'min_max_embedding_keys'` | Trying to load GR00T-H's processor config with upstream's processor | Expected — see the GR00T-H section above; not fixable from this plugin alone |
-| First request takes 30-60s | Cold NEFF cache (3 graphs compiling) | Expected once per cache; subsequent requests are warm (~86 ms end to end) |
+| First request takes ~1-5 min | Cold NEFF cache (3 graphs compiling; longest at TP=4) | Expected once per cache; with cached graphs the first request takes ~40-65 s after engine start, and warm requests ~67 ms (1 core) / ~41 ms (TP=4) for DROID |
 
 ## Conclusion
 
 You served GR00T N1.7 on one NeuronCore, offline and online, and saw where the GR00T-H surgical variant
-diverges. The model-level port is parity-tested against upstream's CPU reference (action MSE 4.66e-4,
-cosine 0.99980 — see the [model card](../models/gr00t-n17.md#accuracy-evaluation)) and runs end to end at
-~86 ms per request warm.
+diverges. The served port is parity-tested against upstream's CPU reference (DROID action MSE 3.6e-4,
+cosine 0.99985 on one core; all TP ranks bit-identical — see the
+[model card](../models/gr00t-n17.md#accuracy-evaluation)) and runs at ~67 ms per DROID request on one core,
+~41 ms on one chip at TP=4.
 
 ## Next steps
 

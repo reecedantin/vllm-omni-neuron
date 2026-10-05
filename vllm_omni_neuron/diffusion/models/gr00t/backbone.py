@@ -30,7 +30,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import attention, bias_from_keep, gelu_erf, gelu_tanh, rms_norm, rotate_half, row_parallel, shard_linear
+from .layers import (
+    attention,
+    bias_from_keep,
+    gelu_erf,
+    gelu_tanh,
+    rms_norm,
+    rotate_half,
+    row_parallel,
+    shard_linear,
+)
 
 # ----------------------------------------------------------------------------------------
 # Vision tower
@@ -52,7 +61,9 @@ class _Conv3dPatch(nn.Module):
 class _PatchEmbed(nn.Module):
     def __init__(self, vc: dict):
         super().__init__()
-        self.proj = _Conv3dPatch(vc["in_channels"], vc["temporal_patch_size"], vc["patch_size"], vc["hidden_size"])
+        self.proj = _Conv3dPatch(
+            vc["in_channels"], vc["temporal_patch_size"], vc["patch_size"], vc["hidden_size"]
+        )
 
 
 class _VisionAttention(nn.Module):
@@ -77,7 +88,9 @@ class _VisionAttention(nn.Module):
         qf, kf = q.float(), k.float()
         q = (qf * cs + rotate_half(qf) * sn).to(x.dtype)
         k = (kf * cs + rotate_half(kf) * sn).to(x.dtype)
-        o = attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), allow_nki=True)  # [n, H, L, D]
+        o = attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), allow_nki=True
+        )  # [n, H, L, D]
         return row_parallel(self.proj, o.transpose(1, 2).reshape(n, length, -1), self.tp_group)
 
 
@@ -121,7 +134,11 @@ class _Merger(nn.Module):
         self.linear_fc2 = nn.Linear(self.hidden, vc["out_hidden_size"])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm(x.reshape(-1, self.hidden)) if self.postshuffle else self.norm(x).reshape(-1, self.hidden)
+        x = (
+            self.norm(x.reshape(-1, self.hidden))
+            if self.postshuffle
+            else self.norm(x).reshape(-1, self.hidden)
+        )
         return self.linear_fc2(gelu_erf(self.linear_fc1(x)))
 
 
@@ -141,7 +158,9 @@ class Gr00tVision(nn.Module):
         self.blocks = nn.ModuleList([_VisionBlock(vc) for _ in range(vc["depth"])])
         self.merger = _Merger(vc, postshuffle=False)
         self.deepstack_visual_indexes = list(vc["deepstack_visual_indexes"])
-        self.deepstack_merger_list = nn.ModuleList([_Merger(vc, postshuffle=True) for _ in self.deepstack_visual_indexes])
+        self.deepstack_merger_list = nn.ModuleList(
+            [_Merger(vc, postshuffle=True) for _ in self.deepstack_visual_indexes]
+        )
 
     def shard_tp(self, rank: int, size: int, group) -> None:
         """Shard every ViT block by head / MLP column (one all-reduce after attention and MLP each);
@@ -165,7 +184,11 @@ class Gr00tVision(nn.Module):
         for i, blk in enumerate(self.blocks):
             x = blk(x, cos, sin)
             if i in self.deepstack_visual_indexes:
-                deep.append(self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)](x.reshape(n_tok, c)))
+                deep.append(
+                    self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)](
+                        x.reshape(n_tok, c)
+                    )
+                )
         return (self.merger(x.reshape(n_tok, c)), *deep)
 
 
@@ -201,7 +224,11 @@ class _TextAttention(nn.Module):
     def shard_tp(self, rank: int, size: int, group) -> None:
         if self.hk % size:
             raise ValueError(f"{self.hk} KV heads do not split over TP={size}")
-        for lin in (self.q_proj, self.k_proj, self.v_proj):  # GQA groups stay intact: H/size per H_kv/size
+        for lin in (
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+        ):  # GQA groups stay intact: H/size per H_kv/size
             shard_linear(lin, 0, rank, size)
         shard_linear(self.o_proj, 1, rank, size)
         self.h //= size
@@ -236,7 +263,9 @@ class _TextMLP(nn.Module):
         self.tp_group = group
 
     def forward(self, x):
-        return row_parallel(self.down_proj, F.silu(self.gate_proj(x)) * self.up_proj(x), self.tp_group)
+        return row_parallel(
+            self.down_proj, F.silu(self.gate_proj(x)) * self.up_proj(x), self.tp_group
+        )
 
 
 class _TextLayer(nn.Module):
@@ -265,7 +294,9 @@ class Gr00tText(nn.Module):
         self.tc = tc
         self.embed_tokens = nn.Embedding(tc["vocab_size"], tc["hidden_size"])
         self.layers = nn.ModuleList([_TextLayer(tc) for _ in range(tc["num_hidden_layers"])])
-        self.norm = _RMSNorm(tc["hidden_size"], tc["rms_norm_eps"])  # loaded, unused (pre-norm output)
+        self.norm = _RMSNorm(
+            tc["hidden_size"], tc["rms_norm_eps"]
+        )  # loaded, unused (pre-norm output)
 
     def shard_tp(self, rank: int, size: int, group) -> None:
         """Shard every decoder layer by head / MLP column; embeddings and norms stay replicated."""
@@ -316,7 +347,9 @@ class BackboneInputs:
 # Image-count buckets for the vision graph: a request with n images runs the smallest bucket >= n
 # (padded images are zero pixels whose tokens are never gathered), so a new camera/frame count
 # reuses a compiled graph instead of compiling its own. Counts above the largest bucket run as is.
-IMAGE_BUCKETS = tuple(int(b) for b in os.environ.get("GR00T_IMAGE_BUCKETS", "1,2,3,4,6,8").split(",") if b)
+IMAGE_BUCKETS = tuple(
+    int(b) for b in os.environ.get("GR00T_IMAGE_BUCKETS", "1,2,3,4,6,8").split(",") if b
+)
 
 
 def pick_image_bucket(n: int, buckets=IMAGE_BUCKETS) -> int:
@@ -342,12 +375,14 @@ class BackbonePrep:
         self.cfg = hf_config
         vc = hf_config.vision_config
         self.merge = int(vc.spatial_merge_size)
-        self.side = int(vc.num_position_embeddings ** 0.5)
+        self.side = int(vc.num_position_embeddings**0.5)
         self.image_token_id = int(hf_config.image_token_id)
         self.vis_rope = Qwen3VLVisionRotaryEmbedding(vc)
         self.txt_rope = Qwen3VLTextRotaryEmbedding(hf_config.text_config)
         shim = SimpleNamespace(config=hf_config)
-        shim.get_vision_position_ids = lambda *a, **k: Qwen3VLModel.get_vision_position_ids(shim, *a, **k)
+        shim.get_vision_position_ids = lambda *a, **k: Qwen3VLModel.get_vision_position_ids(
+            shim, *a, **k
+        )
         self._rope_index = lambda *a, **k: Qwen3VLModel.get_rope_index(shim, *a, **k)
         self._vision_cache: dict = {}  # grid -> (taps, weights, cos, sin): a pure function of the grid
         # (token ids, mm types, grid, bucket) -> text tables. A robot repeats its instruction every
@@ -369,28 +404,47 @@ class BackbonePrep:
         )
 
         idx, w = get_vision_interpolation_indices_and_weights(
-            grid_thw, num_grid_per_side=self.side, mode="bilinear", align_corners=True, spatial_merge_size=self.merge)
+            grid_thw,
+            num_grid_per_side=self.side,
+            mode="bilinear",
+            align_corners=True,
+            spatial_merge_size=self.merge,
+        )
         pos = get_vision_position_ids(grid_thw, self.merge)
         cos, sin = self.vis_rope(torch.zeros(1), pos)
         return idx.long(), w.float(), cos.float(), sin.float()
 
     @torch.no_grad()
-    def __call__(self, input_ids, attention_mask, pixel_values, image_grid_thw, mm_token_type_ids=None,
-                 bucket: int | None = None, image_buckets=None) -> BackboneInputs:
+    def __call__(
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values,
+        image_grid_thw,
+        mm_token_type_ids=None,
+        bucket: int | None = None,
+        image_buckets=None,
+    ) -> BackboneInputs:
         if input_ids.shape[0] != 1:
             raise NotImplementedError("GR00T on Neuron serves one observation per call (batch 1)")
         grid = image_grid_thw.long()
         if not bool((grid == grid[0]).all()):
             raise ValueError(f"all images of a request must share one grid, got {grid.tolist()}")
         n_real = int(grid[:, 0].sum())  # images have t == 1
-        n_images = pick_image_bucket(n_real, IMAGE_BUCKETS if image_buckets is None else image_buckets)
+        n_images = pick_image_bucket(
+            n_real, IMAGE_BUCKETS if image_buckets is None else image_buckets
+        )
         vgrid = grid[:1].expand(n_images, -1) if n_images != grid.shape[0] else grid
         pidx, pw, vcos, vsin = self.vision_tables(vgrid)
         pixels = pixel_values
         if n_images != n_real:  # zero images up to the bucket; their tokens are never gathered
             per = pixel_values.shape[0] // n_real
-            pixels = torch.cat([pixel_values, pixel_values.new_zeros((n_images - n_real) * per,
-                                                                     pixel_values.shape[1])])
+            pixels = torch.cat(
+                [
+                    pixel_values,
+                    pixel_values.new_zeros((n_images - n_real) * per, pixel_values.shape[1]),
+                ]
+            )
 
         am = attention_mask.long()
         real = int(am.sum())
@@ -398,8 +452,13 @@ class BackbonePrep:
         if real > s:
             raise ValueError(f"prompt has {real} tokens, bucket is {s}")
         grid_key = tuple(grid.reshape(-1).tolist())
-        txt_key = (input_ids.numpy().tobytes(), am.numpy().tobytes(),
-                   None if mm_token_type_ids is None else mm_token_type_ids.numpy().tobytes(), grid_key, s)
+        txt_key = (
+            input_ids.numpy().tobytes(),
+            am.numpy().tobytes(),
+            None if mm_token_type_ids is None else mm_token_type_ids.numpy().tobytes(),
+            grid_key,
+            s,
+        )
         txt = self._text_cache.get(txt_key)
         if txt is None:
             txt = self._text_tables(input_ids, am, grid, mm_token_type_ids, real, s)
@@ -410,17 +469,34 @@ class BackbonePrep:
             self._text_cache.move_to_end(txt_key)
         pid, index, img, tcos, tsin, bias, valid = txt
         return BackboneInputs(
-            pixels=pixels, pos_index=pidx, pos_weight=pw, vis_cos=vcos, vis_sin=vsin, n_images=n_images,
-            input_ids=pid, image_index=index, image_keep=img[..., None], txt_cos=tcos, txt_sin=tsin,
-            txt_bias=bias, valid=valid, image_mask=img, real_len=real, n_real_images=n_real,
-            vis_key=(grid_key[:3], n_images), txt_key=txt_key)
+            pixels=pixels,
+            pos_index=pidx,
+            pos_weight=pw,
+            vis_cos=vcos,
+            vis_sin=vsin,
+            n_images=n_images,
+            input_ids=pid,
+            image_index=index,
+            image_keep=img[..., None],
+            txt_cos=tcos,
+            txt_sin=tsin,
+            txt_bias=bias,
+            valid=valid,
+            image_mask=img,
+            real_len=real,
+            n_real_images=n_real,
+            vis_key=(grid_key[:3], n_images),
+            txt_key=txt_key,
+        )
 
     def _text_tables(self, input_ids, am, grid, mm_token_type_ids, real: int, s: int):
         keep_tok = am[0].bool()
         ids = input_ids[:, keep_tok]  # drop (left) padding: batch 1 has none in practice
         mm = mm_token_type_ids[:, keep_tok] if mm_token_type_ids is not None else None
         if mm is not None:
-            pos3, _ = self._rope_index(ids, mm, image_grid_thw=grid, attention_mask=torch.ones_like(ids))
+            pos3, _ = self._rope_index(
+                ids, mm, image_grid_thw=grid, attention_mask=torch.ones_like(ids)
+            )
         else:  # no mm_token_type_ids: HF falls back to 1-D positions
             pos3 = torch.arange(real).view(1, 1, -1).expand(3, 1, -1)
         pos = torch.zeros(3, 1, s, dtype=torch.long)
