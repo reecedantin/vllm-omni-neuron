@@ -79,7 +79,9 @@ class GemmaVariantConfig:
         self.head_dim = head_dim
 
 
-def get_gemma_config(variant: str) -> GemmaVariantConfig:
+def get_gemma_config(variant: str | dict) -> GemmaVariantConfig:
+    if isinstance(variant, dict):  # neuron: explicit dims (shrunk structure-test checkpoints)
+        return GemmaVariantConfig(**variant)
     if variant == "gemma_2b":
         return GemmaVariantConfig(2048, 18, 16384, 8, 1, 256)
     elif variant == "gemma_300m":
@@ -369,7 +371,7 @@ class PaliGemmaWithActionExpert(nn.Module):
     Ref: lerobot/policies/pi0/modeling_pi0.py PaliGemmaWithExpertModel
     """
 
-    def __init__(self, vlm_config, action_expert_config):
+    def __init__(self, vlm_config, action_expert_config, vision_dims: dict | None = None):
         super().__init__()
 
         # Build HF PaliGemma config from the variant dims we expose.
@@ -394,6 +396,12 @@ class PaliGemmaWithActionExpert(nn.Module):
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.dtype = "float32"
+        # neuron: optional SigLIP dims override (shrunk structure-test checkpoints); the
+        # projector always maps the vision width onto the VLM width.
+        for key, value in (vision_dims or {}).items():
+            setattr(vlm_config_hf.vision_config, key, value)
+        if vision_dims:
+            vlm_config_hf.vision_config.projection_dim = vlm_config.width
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -550,13 +558,16 @@ class Pi0ForActionPrediction(nn.Module):
 
         paligemma_variant = getattr(config, "paligemma_variant", "gemma_2b")
         action_expert_variant = getattr(config, "action_expert_variant", "gemma_300m")
-        vlm_config = get_gemma_config(paligemma_variant)
-        expert_config = get_gemma_config(action_expert_variant)
+        variant_dims = getattr(config, "variant_dims", None) or {}  # neuron
+        vlm_config = get_gemma_config(variant_dims.get("paligemma") or paligemma_variant)
+        expert_config = get_gemma_config(variant_dims.get("action_expert") or action_expert_variant)
         self.vlm_width = vlm_config.width
         self.expert_width = expert_config.width
 
         # Dual backbone
-        self.paligemma_with_expert = PaliGemmaWithActionExpert(vlm_config, expert_config)
+        self.paligemma_with_expert = PaliGemmaWithActionExpert(
+            vlm_config, expert_config, vision_dims=variant_dims.get("vision")
+        )
 
         # Action chunk projections (openpi pi0_pytorch.py).
         self.action_in_proj = nn.Linear(self.action_dim, self.expert_width)

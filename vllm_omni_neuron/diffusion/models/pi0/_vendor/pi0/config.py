@@ -39,6 +39,9 @@ class Pi0Config:
     # Backbone variants — mapped to Gemma dimensions by ``get_gemma_config``.
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
+    # neuron: explicit dims overriding the variants ({"paligemma": {...}, "action_expert": {...}});
+    # only shrunk structure-test checkpoints carry it.
+    variant_dims: dict | None = None
 
     # Action chunk shape.
     chunk_size: int = 50

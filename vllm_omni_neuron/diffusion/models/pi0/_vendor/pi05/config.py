@@ -104,6 +104,12 @@ class Pi05Config:
     # Backbone variants — mapped to Gemma dimensions by ``get_gemma_config``.
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
+    # neuron: explicit dims overriding the variants ({"paligemma": {...}, "action_expert": {...},
+    # "vision": {...}}); only shrunk structure-test checkpoints carry it.
+    variant_dims: dict | None = None
+    # neuron: the LeRobot policy type the checkpoint declares ("pi05" or "pi052"). PI0.5 v2
+    # (pi052) shares the pi05 action path; it differs in the prompt (hierarchical language).
+    policy_type: str = "pi05"
 
     # Action chunk shape.
     chunk_size: int = 50
@@ -304,9 +310,11 @@ class Pi05Config:
         raw = dict(model_config)
         _reject_unsupported_capabilities(raw)
 
-        model_type = raw.pop("type", "pi05")
-        if model_type != "pi05":
-            raise ValueError(f"Expected a π0.5 checkpoint (type='pi05'), got type={model_type!r}.")
+        # neuron: a dict rebuilt from a resolved config carries policy_type instead of "type".
+        model_type = raw.pop("type", raw.get("policy_type", "pi05"))
+        if model_type not in ("pi05", "pi052"):  # neuron: pi052 shares the pi05 action path
+            raise ValueError(f"Expected a π0.5 checkpoint (type='pi05' or 'pi052'), got type={model_type!r}.")
+        raw["policy_type"] = model_type
 
         if "image_resolution" in raw:
             raw["image_resolution"] = tuple(raw["image_resolution"])

@@ -94,9 +94,9 @@ class Pi0Pipeline(nn.Module):
             return None
         if os.path.isdir(model):
             return model
-        from vllm_omni.transformers_utils.repo_utils import hf_api
+        from huggingface_hub import snapshot_download  # neuron: vllm-omni 0.24 has no repo_utils.hf_api
 
-        return hf_api().snapshot_download(
+        return snapshot_download(
             repo_id=model,
             allow_patterns=["*.json", "*.safetensors", "*.model", "tokenizer*"],
         )
