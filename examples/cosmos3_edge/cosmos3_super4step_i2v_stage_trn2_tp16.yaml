@@ -1,0 +1,20 @@
+# Cosmos3-Super 4-step I2V (distilled) serving target on Trn2: row 0 (chips 0-3), TP=16.
+# 4 fixed SDE steps (FlowMatchEulerDiscreteScheduler t_list); no action/audio in this checkpoint.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Cosmos3OmniPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        compile_vae_encoder: true
+        guardrails: false
+      parallel_config:
+        tensor_parallel_size: 16

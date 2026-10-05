@@ -1,0 +1,27 @@
+# Cosmos3-Super 4-step I2V (distilled) on Trn2, long clips (e.g. 832x480x189f): 8 chips, TP=8 x CP=4
+# (GEN video tokens split over 4 CP ranks, per-layer K/V all-gather on the Trn2 physical mesh), VAE
+# decode patch-parallel over all 32 ranks. TP=8 without CP does not fit 189 frames in HBM.
+# 832x480 decode: export COSMOS3_EDGE_VAE_TILE=256,256,224,192 (fixed 256 px tiles; the untiled
+# 832x480 decoder graph does not compile on Trn2) and COSMOS3_EDGE_VAE_HOST_GATHER_T=12 (long clips gather
+# the decoded tiles on the host; see the model card).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Cosmos3OmniPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        compile_vae_encoder: true
+        guardrails: false
+      parallel_config:
+        tensor_parallel_size: 8
+        cfg_parallel_size: 1
+        ring_degree: 4
+        vae_patch_parallel_size: 32

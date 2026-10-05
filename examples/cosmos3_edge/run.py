@@ -30,44 +30,77 @@ ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")
 
 parser = argparse.ArgumentParser(description="Cosmos3-Edge on Neuron")
 parser.add_argument("--mode", choices=sorted(DEFAULTS), default="t2i")
-parser.add_argument("--model-path", default=os.environ.get("COSMOS3_EDGE_WEIGHTS", "nvidia/Cosmos3-Edge"))
+parser.add_argument(
+    "--model-path", default=os.environ.get("COSMOS3_EDGE_WEIGHTS", "nvidia/Cosmos3-Edge")
+)
 parser.add_argument("--stage-config", default=None)
-parser.add_argument("--prompt", default="A red sports car parked on a wet city street at golden hour, photorealistic")
+parser.add_argument(
+    "--prompt",
+    default="A red sports car parked on a wet city street at golden hour, photorealistic",
+)
 parser.add_argument("--negative-prompt", default=None)
-parser.add_argument("--image", default=None, help="conditioning image (i2v, policy, forward_dynamics)")
+parser.add_argument(
+    "--image", default=None, help="conditioning image (i2v, policy, forward_dynamics)"
+)
 parser.add_argument("--video", default=None, help="conditioning video (inverse_dynamics)")
 parser.add_argument("--domain", default="droid_lerobot", help="action embodiment domain")
 parser.add_argument("--raw-action-dim", type=int, default=7)
 parser.add_argument("--action-chunk", type=int, default=16)
 parser.add_argument("--action-fps", type=float, default=12.0)
-parser.add_argument("--resolution", default="256", help="action-mode resolution class (256 / 480 / 720)")
-parser.add_argument("--actions", default=None, help="forward_dynamics: JSON file with [chunk x raw_action_dim] actions")
+parser.add_argument(
+    "--resolution", default="256", help="action-mode resolution class (256 / 480 / 720)"
+)
+parser.add_argument(
+    "--actions",
+    default=None,
+    help="forward_dynamics: JSON file with [chunk x raw_action_dim] actions",
+)
 parser.add_argument("--height", type=int)
 parser.add_argument("--width", type=int)
 parser.add_argument("--num-frames", type=int)
 parser.add_argument("--steps", type=int)
-parser.add_argument("--guidance-scale", type=float, default=None, help="default: the pipeline's per-mode default")
+parser.add_argument(
+    "--guidance-scale", type=float, default=None, help="default: the pipeline's per-mode default"
+)
 parser.add_argument("--fps", type=int, default=24)
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--output", default="cosmos3_edge_out")
 parser.add_argument("--profile", action="store_true")
-parser.add_argument("--action-only", action="store_true",
-                    help="action modes: return actions only, skip the VAE video decode (extra_args action_only)")
+parser.add_argument(
+    "--warm-repeats",
+    type=int,
+    default=1,
+    help="with --profile: number of warm repeats of the request (reports each and the median)",
+)
+parser.add_argument(
+    "--action-only",
+    action="store_true",
+    help="action modes: return actions only, skip the VAE video decode (extra_args action_only)",
+)
 args = parser.parse_args()
 
 os.environ.setdefault("NEURON_LOGICAL_NC_CONFIG", "1")  # NeuronCore-v2 (inf2/trn1); trn2 uses 2
 
 
 def main() -> None:
-    stage_cfg = args.stage_config or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cosmos3_edge_stage.yaml")
-    timeout = int(os.environ.get("COSMOS3_HANDSHAKE_TIMEOUT_S", "7200"))  # cold compiles exceed the 600 s default
+    stage_cfg = args.stage_config or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "cosmos3_edge_stage.yaml"
+    )
+    timeout = int(
+        os.environ.get("COSMOS3_HANDSHAKE_TIMEOUT_S", "7200")
+    )  # cold compiles exceed the 600 s default
     try:
         import vllm_omni.diffusion.stage_diffusion_proc as sdp
 
         sdp._HANDSHAKE_POLL_TIMEOUT_S = max(getattr(sdp, "_HANDSHAKE_POLL_TIMEOUT_S", 0), timeout)
     except Exception as exc:  # noqa: BLE001
         print(f"[init] handshake timeout not patched: {exc!r}")
-    omni = Omni(model=args.model_path, stage_configs_path=stage_cfg, stage_init_timeout=timeout, init_timeout=timeout)
+    omni = Omni(
+        model=args.model_path,
+        stage_configs_path=stage_cfg,
+        stage_init_timeout=timeout,
+        init_timeout=timeout,
+    )
 
     d = DEFAULTS[args.mode]
     kw = dict(
@@ -81,9 +114,14 @@ def main() -> None:
     if args.guidance_scale is not None:
         kw["guidance_scale"] = args.guidance_scale
     if args.mode in ACTION_MODES:
-        extra = {"action_mode": args.mode, "domain_name": args.domain, "raw_action_dim": args.raw_action_dim,
-                 "action_chunk_size": args.action_chunk, "resolution": args.resolution,
-                 "action_fps": args.action_fps}
+        extra = {
+            "action_mode": args.mode,
+            "domain_name": args.domain,
+            "raw_action_dim": args.raw_action_dim,
+            "action_chunk_size": args.action_chunk,
+            "resolution": args.resolution,
+            "action_fps": args.action_fps,
+        }
         if args.action_only:
             extra["action_only"] = True
         if args.mode == "forward_dynamics":
@@ -113,17 +151,27 @@ def main() -> None:
 
         if not args.video:
             raise SystemExit("--video is required for --mode inverse_dynamics")
-        frames = [Image.fromarray(f.to_ndarray(format="rgb24")) for f in av.open(args.video).decode(video=0)]
+        frames = [
+            Image.fromarray(f.to_ndarray(format="rgb24"))
+            for f in av.open(args.video).decode(video=0)
+        ]
         prompt["multi_modal_data"] = {"video": frames[: kw["num_frames"]]}
 
     print(f"[run] {args.mode}: {kw}")
     t0 = time.perf_counter()
     result = omni.generate(prompt, params)
-    print(f"[run] first request (includes compile/load on a cold cache): {time.perf_counter() - t0:.2f}s")
+    print(
+        f"[run] first request (includes compile/load on a cold cache): {time.perf_counter() - t0:.2f}s"
+    )
     if args.profile:
-        t0 = time.perf_counter()
-        result = omni.generate(prompt, params)
-        print(f"[profile] warm request: {time.perf_counter() - t0:.2f}s")
+        warm = []
+        for _ in range(max(1, args.warm_repeats)):
+            t0 = time.perf_counter()
+            result = omni.generate(prompt, params)
+            warm.append(time.perf_counter() - t0)
+            print(f"[profile] warm request: {warm[-1]:.2f}s")
+        if len(warm) > 1:
+            print(f"[profile] warm median of {len(warm)}: {sorted(warm)[len(warm) // 2]:.2f}s")
     if args.mode in ACTION_MODES:
         save_actions(result)
     save(result)
@@ -136,8 +184,14 @@ def save_actions(result) -> None:
     import numpy as np
 
     ro = result[0].request_output
-    print("[run] request_output fields:", {n: type(getattr(ro, n, None)).__name__ for n in dir(ro)
-                                          if not n.startswith("_") and not callable(getattr(ro, n, None))})
+    print(
+        "[run] request_output fields:",
+        {
+            n: type(getattr(ro, n, None)).__name__
+            for n in dir(ro)
+            if not n.startswith("_") and not callable(getattr(ro, n, None))
+        },
+    )
     found = {}
     imgs = getattr(ro, "images", None) or []
     for i, item in enumerate(imgs):
@@ -157,7 +211,11 @@ def save_actions(result) -> None:
     for src, d in found.items():
         for k, v in d.items():
             if "action" in str(k):
-                arr = v.detach().cpu().float().numpy() if hasattr(v, "detach") else np.asarray(v, dtype=object)
+                arr = (
+                    v.detach().cpu().float().numpy()
+                    if hasattr(v, "detach")
+                    else np.asarray(v, dtype=object)
+                )
                 out[f"{src}.{k}"] = arr.tolist() if arr.dtype != object else str(v)
     path = (args.output.rsplit(".", 1)[0]) + "_actions.json"
     with open(path, "w") as f:
@@ -202,7 +260,11 @@ def save(result) -> None:
             from diffusers.utils import export_to_video
 
             path = args.output if args.output.endswith(".mp4") else f"{args.output}_{i}.mp4"
-            export_to_video(list(arr.astype(np.float32) if arr.dtype != np.uint8 else arr / 255.0), path, fps=args.fps)
+            export_to_video(
+                list(arr.astype(np.float32) if arr.dtype != np.uint8 else arr / 255.0),
+                path,
+                fps=args.fps,
+            )
         print(f"[run] saved {path}")
 
 

@@ -1,0 +1,22 @@
+# Cosmos3-Nano generator on Trn2 (vLLM-Omni + Neuron plugin): one Trainium2 chip at LNC=2
+# = 4 logical NeuronCores, TP=4 (32 query heads / 8 K/V heads -> 8 / 2 per core). The UND and
+# GEN towers and the Wan2.2-5B VAE compile per geometry on first use; later runs hit the NEFF cache.
+# `devices`: comma-separated logical NeuronCore ids (indices into NEURON_VISIBLE_DEVICES when set);
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Cosmos3OmniPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        compile_vae_encoder: true
+        guardrails: false
+      parallel_config:
+        tensor_parallel_size: 4

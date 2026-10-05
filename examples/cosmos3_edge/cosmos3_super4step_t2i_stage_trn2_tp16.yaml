@@ -1,0 +1,24 @@
+# Cosmos3-Super 4-step T2I (distilled) on Trn2: one torus row (chips 0-3), TP=16, VAE decode
+# patch-parallel over the 16 ranks. 4 fixed SDE steps; guidance is fixed at 1.0 by the checkpoint.
+# 832x480 decode: export COSMOS3_EDGE_VAE_TILE=256,256,224,192 (fixed 256 px tiles; the untiled
+# 832x480 decoder graph does not compile on Trn2).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Cosmos3OmniPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        compile_vae_encoder: true
+        guardrails: false
+      parallel_config:
+        tensor_parallel_size: 16
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 16
