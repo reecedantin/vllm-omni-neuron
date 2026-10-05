@@ -62,6 +62,22 @@ Environment variables: `HV15_VAE_HOST=1` (host VAE decode instead of device), `H
 `HV15_BLOCKS_PER_GRAPH` (DiT blocks per compiled graph),
 `HV15_PROFILE=1` (per-call timings).
 
+### Image-to-video at 720p (distilled sparse checkpoint)
+
+Build the checkpoint once with `examples/hunyuanvideo15/convert_distilled_sparse.py` (see its docstring), then run
+on 16 cores with TP=8 x context parallel 2 and the sparse (SSTA) attention:
+
+```bash
+HV15_BLOCKS_PER_GRAPH=6 python examples/hunyuanvideo15/run.py \
+  --model-path <dir>/720p_i2v_distilled_sparse \
+  --stage-config examples/hunyuanvideo15/hunyuanvideo15_i2v_stage_tp8_cp2.yaml \
+  --image first_frame.png --prompt "A cat sleeps on a stack of books, then stretches and looks out at the rain." \
+  --height 720 --width 1280 --num-frames 121 --steps 50 --output hv15_i2v_720p.mp4
+```
+
+The image is resized with a centre crop to the output size. The checkpoint is CFG-distilled, so no negative prompt
+is used. `HV15_ATTN_MODE=dense_tiles` runs dense attention over the same layout (33 frames at this layout).
+
 ## Common issues
 
 | Symptom | Fix |

@@ -1,5 +1,5 @@
 # HunyuanVideo-1.5 T2V on Neuron, one Trn2 chip (4 logical cores): TP=2 x CFG-parallel 2
-# (each guidance branch on its own core pair, host all-gather of the noise prediction per step).
+# (each guidance branch on its own core pair; the noise predictions are exchanged on the device per step).
 # The DiT is compiled per geometry on first use; later runs hit the NEFF cache. The Qwen2.5-VL / byT5
 # text encoders: Qwen2.5-VL tower on the NeuronCores (TP=4), byT5 on the host; the VAE decode is tiled across all ranks (HV15_VAE_HOST=1: host).
 stage_args:
