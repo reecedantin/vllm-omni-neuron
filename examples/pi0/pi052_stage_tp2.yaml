@@ -1,0 +1,24 @@
+# pi0.5 / pi0.52 on two NeuronCores: the PaliGemma LM (action prefix + pi0.52 subtask decode)
+# tensor-parallel over TP=2, with the SigLIP vision tower and the action expert replicated on both
+# ranks. Use two logical cores of one chip. See pi052_stage.yaml for the single-core layout.
+#
+#   python examples/pi0/run.py --model lerobot/pi052_base --stage-config examples/pi0/pi052_stage_tp2.yaml
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: action
+    runtime:
+      process: true
+      devices: "0,1"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Pi05Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        tokenizer: google/paligemma-3b-pt-224
+        max_new_subtask_tokens: 48
+        subtask_kv_cache: true
+      parallel_config:
+        tensor_parallel_size: 2

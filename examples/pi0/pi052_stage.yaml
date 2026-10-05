@@ -1,0 +1,32 @@
+# pi0.5 / pi0.52 VLA on Neuron (vLLM-Omni). One diffusion stage: raw robot observation -> a
+# continuous action chunk [chunk_size, action_dim] via flow matching. pi0.52 additionally runs a
+# hierarchical subtask-generation step (PaliGemma LM head) before the action prompt.
+#
+# Layout: one NeuronCore, TP=1. The model (3.6B params loaded, 6-8 GB bf16) fits one logical core
+# at LNC=2; pi052_stage_tp2.yaml splits the LM over two cores. The prefix, denoise and subtask
+# graphs compile on the first request and cache-hit afterwards.
+#
+#   python examples/pi0/run.py --model lerobot/pi052_base
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: action
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Pi05Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      # LeRobot pi0.5 checkpoints ship no tokenizer. This is the gated Hugging Face repo id; point
+      # it at a local copy to run offline.
+      model_config:
+        tokenizer: google/paligemma-3b-pt-224
+        # pi0.52 only: maximum length of the generated low-level subtask.
+        max_new_subtask_tokens: 48
+        # pi0.52 only: prefill once + KV-cached decode steps (false: re-run the LM per token).
+        subtask_kv_cache: true
+      parallel_config:
+        tensor_parallel_size: 1

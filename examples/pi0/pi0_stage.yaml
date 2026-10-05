@@ -1,0 +1,26 @@
+# pi0 (base) VLA on Neuron (vLLM-Omni). One diffusion stage: raw robot observation (cameras +
+# continuous state + instruction) -> a continuous action chunk [chunk_size, action_dim] via flow
+# matching.
+#
+# Layout: one NeuronCore, TP=1 (~3.3B params, ~6 GB bf16 fits one logical core at LNC=2).
+#
+#   python examples/pi0/run.py --model lerobot/pi0_base --stage-config examples/pi0/pi0_stage.yaml
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: action
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Pi0Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      # LeRobot pi0 checkpoints ship no tokenizer. This is the gated Hugging Face repo id; point it
+      # at a local copy to run offline.
+      model_config:
+        tokenizer: google/paligemma-3b-pt-224
+      parallel_config:
+        tensor_parallel_size: 1
