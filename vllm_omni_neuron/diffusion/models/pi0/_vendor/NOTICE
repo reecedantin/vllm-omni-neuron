@@ -1,0 +1,7 @@
+The files under this directory are vendored from vLLM-Omni
+(https://github.com/vllm-project/vllm-omni), commit ee8fdab1dc26ea8f09d7910cdc98a17c4b0ea02a,
+paths vllm_omni/diffusion/models/{pi0,pi05}/ and {pi0,pi05}_pipeline_config.py.
+Licensed under the Apache License, Version 2.0 (see LICENSE in this directory). Changes: import paths rewritten to this
+package; edits marked "# neuron:" (pi0/pi0.5 variant_dims + vision_dims shrink hooks for
+structure-test checkpoints; pi0.5 accepts the LeRobot pi052 policy type; huggingface_hub.snapshot_download
+instead of the repo_utils.hf_api helper missing from vllm-omni 0.24).
