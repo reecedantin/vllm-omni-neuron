@@ -1,0 +1,13 @@
+The files in this directory are copied from FLUX Action by Black Forest Labs
+(https://github.com/black-forest-labs/flux-action) at commit 830f1ce, licensed under the
+Apache License, Version 2.0 (see LICENSE in this directory).
+
+    sampling.py       <- src/flux_action/inference/sampling.py
+    positional.py     <- src/flux_action/models/positional.py
+    packing.py        <- src/flux_action/processing/packing.py
+    normalization.py  <- src/flux_action/processing/normalization.py
+    history.py        <- src/flux_action/processing/history.py
+    config.py         <- src/flux_action/config.py
+
+The only changes are the package-relative import lines (flux_action.* -> this package), made in a
+separate commit. Copyright 2026 Black Forest Labs. All rights reserved.
