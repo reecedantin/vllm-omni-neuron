@@ -18,7 +18,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
-from .processing import packing
+from . import packing
 
 # Content streams of the full generative trunk, canonical order. The action policy feeds only ``video`` (predicted
 # frames) and ``video_cond`` (the observed frame); the others get dummy tokens that never enter the joint attention,

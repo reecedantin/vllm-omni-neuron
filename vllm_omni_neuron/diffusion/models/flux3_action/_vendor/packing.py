@@ -45,7 +45,7 @@ import torch.nn.functional as F  # noqa: N812
 from einops import repeat
 from torch import Tensor
 
-from flux_action.models.positional import batched_prc_action, batched_prc_txt, batched_prc_vid, times_to_ids
+from .positional import batched_prc_action, batched_prc_txt, batched_prc_vid, times_to_ids
 
 # ---- DROID reference recipe constants -------------------------------------------------------
 FPS = 15.0

@@ -19,11 +19,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from ..models.positional import batched_prc_action, batched_prc_vid, times_to_ids
+from .positional import batched_prc_action, batched_prc_vid, times_to_ids
 from . import normalization, packing
 
 if TYPE_CHECKING:
-    from ..config import PolicyConfig
+    from .config import PolicyConfig
 
 
 class ObservationHistory:
