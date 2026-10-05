@@ -1,0 +1,33 @@
+# FLUX.2-dev text-to-image on Neuron (vLLM-Omni). TP=8 x CP=2 alternative on 16 logical NeuronCores
+# (4 Trn2 chips at LNC=2). Each TP=8 group (one chip pair) holds a full TP shard of the DiT and the text encoder
+# (8.8 + 3.9 GiB per core); context parallelism (`ring_degree`) splits the 512 text + H*W/256 image tokens over the
+# two groups, which all-gather K/V once per block. ~14-16 GiB HBM per core at 1024-2048 px.
+# Recommended: flux2_stage.yaml (TP=8 x CP=4, 32 cores); 8-core alternative: flux2_stage_tp8.yaml.
+# CP must divide 512 and the image-token count: any resolution that is a multiple of 64 px.
+# The VAE decodes on the NeuronCores as 512 px tiles (128 px overlap) with whole-image GroupNorm statistics,
+# dealt across all ranks. Graphs compile per resolution on first use (VAE tile graphs once).
+#
+# `devices` are logical indices into NEURON_VISIBLE_DEVICES (a comma list, not a range).
+# VAE knobs are environment variables (see vllm_omni_neuron/diffusion/models/flux2/vae_flux2.py).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Flux2Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # DiT blocks per compiled graph (must divide the 8 double / 48 single blocks; defaults 1 / 6)
+        double_group: 1
+        single_group: 6
+        # text-encoder layers per compiled graph (must divide 10, 20 and 30)
+        te_group: 10
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 2
