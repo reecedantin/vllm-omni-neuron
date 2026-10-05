@@ -1,0 +1,28 @@
+# LTX-2.5 distilled text-to-video (+ 48 kHz audio) on Trainium2, eight chips (32 logical NeuronCores at LNC=2),
+# for large canvases: tensor parallel 8 over each adjacent chip pair x context parallel 4 (the video tokens are
+# split four ways; the audio tokens and the text stay replicated). 4.4 GB of transformer weights per core; 6.56 s at
+# 512x768x121 (no faster than the recommended 16-core ltx2_stage_tp4cp4.yaml) and 17.7 s at 1024x1536x121. The video VAE tiles and the vocoder's time spans are spread over all
+# ranks; the Gemma text encoder runs on rank 0's TP group (new prompts only) and rank 0 returns the output.
+# Multi-process stage: `devices` are logical indices into NEURON_VISIBLE_DEVICES (comma list). The CP degree must
+# divide the video token count ((frames-1)/8+1) x (height/32) x (width/32).
+stage_args:
+- stage_id: 0
+  stage_type: diffusion
+  final_output: true
+  final_output_type: video
+  runtime:
+    process: true
+    devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+    max_batch_size: 1
+  engine_args:
+    model_class_name: LTX2Pipeline
+    model_stage: diffusion
+    dtype: bfloat16
+    model_config:
+      # 48 transformer blocks run as 12 calls of one compiled 4-block graph
+      blocks_per_graph: 4
+      # `transformer` = distilled checkpoint (8 steps); `transformer_full` loads the Full/SFT weights
+      transformer_subfolder: transformer
+    parallel_config:
+      tensor_parallel_size: 8
+      ring_degree: 4
