@@ -19,18 +19,19 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import BaseOutput, apply_lora_scale, is_torch_version, logging
-from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
-from ..attention import AttentionMixin, AttentionModuleMixin, FeedForward
-from ..attention_dispatch import dispatch_attention_fn
-from ..cache_utils import CacheMixin
-from ..embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings, PixArtAlphaTextProjection
-from ..modeling_utils import ModelMixin
-from ..normalization import RMSNorm
-
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
+from diffusers.models._modeling_parallel import ContextParallelInput, ContextParallelOutput
+from diffusers.models.attention import AttentionMixin, AttentionModuleMixin, FeedForward
+from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.cache_utils import CacheMixin
+from diffusers.models.embeddings import (
+    PixArtAlphaCombinedTimestepSizeEmbeddings,
+    PixArtAlphaTextProjection,
+)
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.normalization import RMSNorm
+from diffusers.utils import BaseOutput, apply_lora_scale, is_torch_version, logging
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
