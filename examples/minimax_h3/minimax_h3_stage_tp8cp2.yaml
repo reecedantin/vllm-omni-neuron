@@ -1,0 +1,24 @@
+# FastH3 / MiniMax-H3 (t2va) on Neuron (vLLM-Omni): TP=8 x CP=2 over 16 logical NeuronCores (LNC=2).
+# Each CP rank holds 1/2 of the packed sequence (K/V all-gathered per layer) and the same TP=8 weight shard. On a
+# trn2.48xlarge the worker rebuilds the TP / CP groups on the physical mesh: every TP group is one adjacent chip pair,
+# every CP group one core per pair. The video VAE deals its tiles over all 16 ranks.
+# The recommended layout is minimax_h3_stage.yaml (TP=8 x CP=8, 64 cores).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: MiniMaxH3ModularPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        adaln: device
+        text_encoder: device
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 2
