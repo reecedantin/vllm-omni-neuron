@@ -1,0 +1,27 @@
+# Wan2.2 A14B T2V on a row of 4 Trn2 chips (16 logical cores, LNC=2): TP4 inside each chip,
+# context parallel 4 across the chips (ring_degree 4), both experts resident, VAE decode
+# patch-parallel over all 16 ranks. Same mesh pattern as wan22_stage.yaml (TP4 x CP8 x CFG2 on
+# 64 cores) scaled to one chip row; devices index NEURON_VISIBLE_DEVICES.
+# 480x832x81 -> 21x30x52 = 32760 tokens: divisible by CP4, 8190 per CP rank.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Wan22Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      boundary_ratio: 0.875
+      flow_shift: 5.0
+      vae_use_tiling: true
+      model_config:
+        tp_sequence_parallel: true
+      parallel_config:
+        tensor_parallel_size: 4
+        ring_degree: 4
+        vae_patch_parallel_size: 16
