@@ -41,6 +41,7 @@ from vllm_omni_neuron.diffusion.distributed.cfg_parallel import NeuronCFGParalle
 from vllm_omni_neuron.diffusion.models.umt5_encoder.umt5_encoder import (
     NeuronTextEncoderWrapper,
 )
+from vllm_omni_neuron.diffusion.models.wan2_2 import _gate_dump
 from vllm_omni_neuron.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni_neuron.diffusion.quantization.comfy_fp8_checkpoint import (
     FP8_CHECKPOINT_FILES,
@@ -126,6 +127,39 @@ def _create_transformer_from_config(config: dict) -> WanTransformer3DModel:
                 val = tuple(val)
             kwargs[key] = val
     return WanTransformer3DModel(**kwargs)
+
+
+def _load_vae_config(model: str, local_files_only: bool) -> dict:
+    """The checkpoint's ``vae/config.json`` (empty dict when it cannot be read)."""
+    try:
+        if local_files_only:
+            path = os.path.join(model, "vae", "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(repo_id=model, filename="vae/config.json")
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+class _UnshardedEmbedding(nn.Embedding):
+    """``nn.Embedding`` that accepts (and ignores) the ``rank`` the UMT5 encoder passes.
+
+    At TP=1 the encoder keeps a plain ``nn.Embedding`` but still calls it as
+    ``embed_tokens(ids, rank=rank)`` (the vocab-sharded embedding's signature).
+    """
+
+    def forward(self, input: torch.Tensor, rank: torch.Tensor | None = None) -> torch.Tensor:
+        del rank
+        return super().forward(input)
+
+
+def _allow_rank_kwarg_on_unsharded_embedding(text_encoder: nn.Module) -> None:
+    emb = getattr(text_encoder, "embed_tokens", None)
+    if type(emb) is nn.Embedding:
+        emb.__class__ = _UnshardedEmbedding
 
 
 def _compile_lite_helper(helper, *args, **kwargs):
@@ -588,11 +622,14 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         compiled = getattr(self, "_compiled_cfg_combine", None)
         if compiled is None or cfg_normalize:
-            return super().combine_cfg_noise(
-                positive_noise_pred,
-                negative_noise_pred,
+            return self._dump_combine(
+                super().combine_cfg_noise(
+                    positive_noise_pred,
+                    negative_noise_pred,
+                    true_cfg_scale,
+                    cfg_normalize,
+                ),
                 true_cfg_scale,
-                cfg_normalize,
             )
         if isinstance(positive_noise_pred, tuple) or isinstance(negative_noise_pred, tuple):
             if not (
@@ -611,7 +648,19 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
             positive_noise_pred = positive_noise_pred[0]
             negative_noise_pred = negative_noise_pred[0]
         scale = torch.tensor([true_cfg_scale], dtype=torch.float32).to(positive_noise_pred.device)
-        return compiled(positive_noise_pred, negative_noise_pred, scale)
+        return self._dump_combine(
+            compiled(positive_noise_pred, negative_noise_pred, scale), true_cfg_scale
+        )
+
+    def _dump_combine(self, combined, true_cfg_scale):
+        """Record the first CFG combine for the parity dump (no-op unless dumping)."""
+        if self._dump_noise_pred_path and not self._dump_combine_done:
+            self._dump_combine_done = True
+            c = combined[0] if isinstance(combined, tuple) else combined
+            self._write_noise_pred_dump(
+                combined=c.detach().cpu().float(), guidance_scale=float(true_cfg_scale)
+            )
+        return combined
 
     def __init__(self, *, od_config, prefix: str = ""):
         # Skip Wan22Pipeline.__init__ (GPU-centric). Call nn.Module directly.
@@ -623,7 +672,7 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         local_files_only = os.path.isdir(model)
 
-        # TODO: Support expand_timesteps for TI2V models (read from model_index.json)
+        # expand_timesteps (TI2V-5B) is read from model_index.json below.
         self.expand_timesteps = False
         self.has_transformer_2 = False
         if local_files_only:
@@ -665,6 +714,7 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
             dtype=dtype,
             tp_group=tp_group,
         )
+        _allow_rank_kwarg_on_unsharded_embedding(self.text_encoder)
 
         # VAE patch parallelism: when vae_patch_parallel_size > 1, VAE decode is
         # sharded across the VAE-parallel group. The distributed executor's
@@ -699,6 +749,12 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
             self.is_vae_rank = dist.get_rank() in vae_ranks
         else:
             self.is_vae_rank = self.is_output_rank
+            # The VAE lives on rank 0 alone, but the shared tiled decode/encode deals tiles over
+            # ``tile_parallel_group`` and falls back to the WORLD group when it is unset -- a
+            # gather the other ranks never join (hangs as soon as a latent needs tiling). Give it
+            # a one-rank group. new_group() is collective, so every rank calls it.
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                self._vae_solo_group = dist.new_group(ranks=[0], backend="gloo")
 
         if self.is_vae_rank:
             vae_cls = (
@@ -710,16 +766,66 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
                 torch_dtype=dtype,
                 local_files_only=local_files_only,
             )
+            solo = getattr(self, "_vae_solo_group", None)
+            if solo is not None:
+                self.vae.tile_parallel_group = solo
             if self.vae_patch_parallel:
                 # Patch parallelism dispatches on tiled_decode(), which requires
                 # tiling. Bind the executor to the VAE subgroup and record the
                 # parallel degree (== subgroup size).
                 self.vae.init_distributed(group=self._vae_group)
                 self.vae.set_parallel_size(vae_pp_size)
+            # Decode tile geometry (pixels): model_config ``vae_tile_sample: [min, stride]`` or
+            # ``[min_h, min_w, stride_h, stride_w]``, or ``WAN22_VAE_TILE`` with the same values.
+            # Default (unset) keeps the VAE's 256/192 (28 tiles at 1280x704, 128 px edge tiles).
+            # Smaller tiles only pay off with more patch-parallel ranks than tiles. The split always
+            # ends in a narrower edge tile; keep it >= 128 px (thin device-decoded edge tiles have
+            # shown corruption): 208,192,144,128 gives 50 tiles at 1280x704, 128 px edges, 64 px
+            # blend. 192,128 square leaves a 64 px bottom row there -- avoid it.
+            tile_spec = (od_config.model_config or {}).get("vae_tile_sample") or os.environ.get(
+                "WAN22_VAE_TILE"
+            )
+            if tile_spec:
+                if isinstance(tile_spec, str):
+                    tile_spec = [int(v) for v in tile_spec.split(",")]
+                tile_spec = [int(v) for v in tile_spec]
+                if len(tile_spec) == 2:  # [min, stride] for both axes
+                    tile_spec = [tile_spec[0], tile_spec[0], tile_spec[1], tile_spec[1]]
+                if len(tile_spec) != 4:
+                    raise ValueError(
+                        "vae_tile_sample: [min, stride] or [min_h, min_w, stride_h, stride_w], "
+                        f"got {tile_spec}"
+                    )
+                min_h, min_w, stride_h, stride_w = tile_spec
+                if not (0 < stride_h <= min_h and 0 < stride_w <= min_w):
+                    raise ValueError(f"vae_tile_sample: need 0 < stride <= min, got {tile_spec}")
+                self.vae.tile_sample_min_height, self.vae.tile_sample_min_width = min_h, min_w
+                self.vae.tile_sample_stride_height = stride_h
+                self.vae.tile_sample_stride_width = stride_w
+                logger.info(
+                    "Wan VAE decode tiles %s (min_h, min_w, stride_h, stride_w px)", tile_spec
+                )
 
         # Initialize transformers (weights loaded via load_weights later)
         model_config_overrides = dict(od_config.model_config or {})
+        model_config_overrides.pop("vae_tile_sample", None)
+        # Debug hooks (env, every rank): WAN_STACK_DUMP_S=N prints every thread's stack to stderr
+        # each N seconds, so a stalled collective names its call site in the log;
+        # WAN_DUMP_FINAL_LATENTS=<path> saves the denoised latent (output rank) before VAE decode.
+        stack_dump_s = int(os.environ.get("WAN_STACK_DUMP_S", "0") or 0)
+        if stack_dump_s > 0:
+            import faulthandler
+
+            faulthandler.dump_traceback_later(stack_dump_s, repeat=True)
+        self._dump_final_latents_path = os.environ.get("WAN_DUMP_FINAL_LATENTS")
         self._comfyui_fp8_model_path = model_config_overrides.pop("comfyui_fp8_model_path", None)
+        self._dump_noise_pred_path = model_config_overrides.pop(
+            "dump_noise_pred", None
+        ) or os.environ.get("WAN_DUMP_NOISE_PRED")
+        self._noise_pred_dumped = False
+        self._dump_calls: list[dict] = []
+        self._dump_extra: dict = {}
+        self._dump_combine_done = False
 
         if load_transformer:
             tf_config = load_transformer_config(model, "transformer", local_files_only)
@@ -763,8 +869,12 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
             self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 8)
         else:
-            self.vae_scale_factor_temporal = 4
-            self.vae_scale_factor_spatial = 8
+            # Ranks without a VAE still size the latents: read the factors from the VAE
+            # config (Wan2.2 TI2V's VAE is 16x spatial, the Wan2.1 VAE 8x). Guessing 8 here
+            # gave non-VAE ranks different latent shapes, hence mismatched DiT collectives.
+            vae_cfg = _load_vae_config(model, local_files_only)
+            self.vae_scale_factor_temporal = int(vae_cfg.get("scale_factor_temporal", 4))
+            self.vae_scale_factor_spatial = int(vae_cfg.get("scale_factor_spatial", 8))
 
         # TODO: Implement custom warmup logic for Neuron HW
         self.skip_warmup = True
@@ -914,6 +1024,8 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
             )
 
         if self._collect_perf:
+            self._perf_barrier(prompt_embeds)
+            self._perf_barrier(negative_prompt_embeds)
             self._text_encode_seconds = time.perf_counter() - t_start
         return prompt_embeds, negative_prompt_embeds
 
@@ -1029,7 +1141,40 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
             self.vae.config.latents_std, device=latents.device, dtype=latents.dtype
         ).view(1, self.vae.config.z_dim, 1, 1, 1)
         latents = latents / latents_std + latents_mean
+        if getattr(self.vae, "_compiled_decoder_first", None) is None:
+            # Eager (CPU-mode) runs never call compile_vae, but the decode path always runs the
+            # per-frame decoder graphs: give it the same wrapper, uncompiled, so the served decode
+            # (including the patch-parallel executor) can be exercised on CPU.
+            from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+                NeuronWanDecoder3d,
+            )
+
+            eager = NeuronWanDecoder3d(self.vae.post_quant_conv, self.vae.decoder)
+            self.vae._compiled_decoder_first = eager
+            self.vae._compiled_decoder_rest = eager
+            if self.vae_patch_parallel and latents.device.type == "cpu":
+                # The executor's pack/concat/blend helpers torch.compile with the Neuron backend;
+                # on a CPU-mode run that would compile NEFFs and reach the runtime: run eagerly.
+                executor = self.vae.distributed_executor
+                executor._compile_device_graph = lambda name, key, fn: fn
         return self.vae.decode(latents, return_dict=False)[0]
+
+    def _perf_barrier(self, tensor) -> None:
+        """Wait for ``tensor`` before a perf-timer read (only when collecting perf metrics).
+
+        Device execution is asynchronous: a stage "returns" as soon as its graphs are queued,
+        so without a barrier its time lands on whichever later stage first waits for a result
+        (the VAE decode / host copy). A one-element host copy of the stage output blocks until
+        that output exists; it is cheap and allowed eagerly under Lite (contiguous source).
+        """
+        if not self._collect_perf or not isinstance(tensor, torch.Tensor):
+            return
+        if tensor.device.type == "cpu" or tensor.numel() == 0:
+            return
+        if tensor.is_contiguous():
+            tensor.view(-1)[:1].to("cpu")
+        else:
+            tensor.to("cpu")
 
     def _release_scheduler_history(self) -> None:
         """Drop the UniPC solver history once the denoise loop is done with it.
@@ -1127,8 +1272,61 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
         self._store_cross_attention_kv(context, key, tuple(kv_cache))
         return noise_pred
 
+    _DUMP_MAX_CALLS = 2  # with CFG: the positive and the negative branch of the first step
+
+    def _maybe_dump_noise_pred(self, noise_pred, inputs) -> None:
+        """Teacher-forced parity dump of the first DiT call(s) and the first CFG combine.
+
+        Enabled by ``model_config.dump_noise_pred: <path>`` in the stage YAML (reaches every
+        worker through the engine config) or ``WAN_DUMP_NOISE_PRED``. Rank 0 writes one ``.pt``:
+        ``calls`` = the first ``_DUMP_MAX_CALLS`` DiT calls, each with ``hidden_states``,
+        ``timestep``, ``encoder_hidden_states`` and ``noise_pred``; plus ``combined`` /
+        ``guidance_scale`` after the first CFG combine. Top-level keys mirror ``calls[0]`` for
+        single-call consumers. Tensors move to host before any cast (an uncompiled cast of a
+        device tensor is rejected under Lite). Rewritten after every event so a partial run
+        still leaves evidence.
+        """
+        if not self._dump_noise_pred_path or self._noise_pred_dumped:
+            return
+        record = {k: v.detach().cpu().float() for k, v in inputs.items()}
+        record["noise_pred"] = noise_pred.detach().cpu().float()
+        self._dump_calls.append(record)
+        if len(self._dump_calls) >= self._DUMP_MAX_CALLS:
+            self._noise_pred_dumped = True
+        self._write_noise_pred_dump()
+
+    def _write_noise_pred_dump(self, **extra) -> None:
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        self._dump_extra.update(extra)
+        path = self._dump_noise_pred_path
+        try:
+            out = dict(self._dump_calls[0]) if self._dump_calls else {}
+            out["calls"] = self._dump_calls
+            out.update(self._dump_extra)
+            torch.save(out, path)
+            print(
+                f"[dump_noise_pred] wrote {path} calls={len(self._dump_calls)} "
+                f"extra={sorted(self._dump_extra)}",
+                flush=True,
+            )
+        except Exception as e:  # pragma: no cover - diagnostic only
+            print(f"[dump_noise_pred] FAILED {path}: {e!r}", flush=True)
+
     def predict_noise(self, current_model=None, **kwargs):
+        dump_inputs = (
+            {
+                k: kwargs[k]
+                for k in ("hidden_states", "timestep", "encoder_hidden_states")
+                if isinstance(kwargs.get(k), torch.Tensor)
+            }
+            if self._dump_noise_pred_path and not self._noise_pred_dumped
+            else {}
+        )
         timestep = kwargs["timestep"]
+        gate_step = _gate_dump.current_step()
+        _gate_dump.step_tensor(self, gate_step, "hidden_states", kwargs.get("hidden_states"))
+        _gate_dump.step_tensor(self, gate_step, "timestep", timestep)
         lite_runtime = is_lite_runtime()
         if lite_runtime:
             kwargs["timestep"] = (
@@ -1160,6 +1358,8 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
                 noise_pred = noise_pred[0]
             if not isinstance(noise_pred, torch.Tensor):
                 raise TypeError("Lite transformer output must resolve to a tensor")
+        self._maybe_dump_noise_pred(noise_pred, dump_inputs)
+        _gate_dump.step_tensor(self, gate_step, "pred", noise_pred)
         return noise_pred
 
     def scheduler_step_maybe_with_cfg(
@@ -1171,6 +1371,9 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
         per_request_scheduler=None,
         generator=None,
     ):
+        gate_step = _gate_dump.current_step()
+        _gate_dump.step_tensor(self, gate_step, "noise_pred", noise_pred)
+        _gate_dump.step_tensor(self, gate_step, "latents", latents)
         latents = super().scheduler_step_maybe_with_cfg(
             noise_pred,
             t,
@@ -1225,18 +1428,21 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
         if sampling_params is not None:
             sampling_params.output_type = "latent"
         self._clear_cross_attention_kv_cache()
+        _gate_dump.begin_request(self, req)
         try:
             result = super().forward(req)
         finally:
             if sampling_params is not None:
                 sampling_params.output_type = requested_output_type
             self._clear_cross_attention_kv_cache()
+        _gate_dump.rank_digest(self, getattr(result, "output", None))
         # Same reasoning for the scheduler's solver history: model_outputs and last_sample
         # are read only inside step() and are re-nulled by the next set_timesteps, so they
         # are dead here, but they pin solver_order + 1 device latents (12 MB at 480p,
         # 28 MB at 720p) across the offload window below.
         self._release_scheduler_history()
         if self._collect_perf:
+            self._perf_barrier(getattr(result, "output", None))
             parent_forward_seconds = time.perf_counter() - t_parent_start
 
         run_vae_decode = self.is_vae_rank and not wants_latents
@@ -1254,8 +1460,11 @@ class NeuronWanPipeline(NeuronCFGParallelMixin, Wan22Pipeline):
         if self._collect_perf:
             t_vae_start = time.perf_counter()
         output = None
+        if self._dump_final_latents_path and run_vae_decode and self.is_output_rank:
+            torch.save(result.output.to("cpu").float(), self._dump_final_latents_path)
         if run_vae_decode:
             decoded = self._decode_latents(result.output)
+            self._perf_barrier(decoded)
             if self.is_output_rank:
                 output = decoded
         elif wants_latents and self.is_output_rank:

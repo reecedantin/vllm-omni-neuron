@@ -63,7 +63,7 @@ from vllm_omni_neuron.diffusion.layers.rope import (
     WanRotaryPosEmbed,
     apply_rotary_emb_wan,
 )
-from vllm_omni_neuron.diffusion.quantization.adaln_kernels import adaln_modulate
+from vllm_omni_neuron.diffusion.quantization.adaln_kernels import _eager_adaln, adaln_modulate
 from vllm_omni_neuron.diffusion.quantization.comfy_fp8_checkpoint import (
     FP8_TOP_LINEAR_MAP,
     SUPPORTED_NATIVE_FP8_MODULES,
@@ -486,10 +486,10 @@ class WanConfig:
     the ComfyUI FP8 checkpoint; ``modules_to_not_convert`` selects which projection
     groups are CPU-dequantized rather than executed through native ROW_MX kernels.
 
-    CP self-attention runs the ring-attention NKI kernel (see :func:`wan_cp_self_attention`),
-    which keeps K/V local and rotates it around the CP group. Where the kernel cannot run at
-    all (CPU mode, fake-tensor tracing, NKI kernels disabled) it falls back to all-gather +
-    flash — a capability check, not a setting.
+    CP self-attention all-gathers K/V across the CP group and runs flash attention with the true
+    row maximum (see :func:`wan_cp_self_attention`); the const-max ring-attention kernel, which
+    keeps K/V local, is opt-in (``WAN22_CP_RING_ATTENTION=1``) because its softmax bound zeroes
+    rows in late, low-noise steps.
     """
 
     patch_size: tuple = (1, 2, 2)
@@ -809,6 +809,21 @@ def sp_entry(
     return gathered
 
 
+def cp_ring_attention_enabled() -> bool:
+    """Opt-in (``WAN22_CP_RING_ATTENTION=1``) for the const-max ring-attention kernel.
+
+    Off by default for accuracy. The ring kernel subtracts a Cauchy-Schwarz bound
+    ``scale * ||q_i|| * max_j ||k_j||`` instead of each row's true maximum, so its exponent shift
+    over-subtracts by the gap between the bound and the row max. In the Wan2.2 TI2V-5B DiT that gap
+    exceeds the ~85-87 nats where every probability of a row underflows bf16 (up to ~260 nats in
+    late blocks at low noise, 1280x704x121, t=92), and the kernel's sum clamp then returns an
+    all-zero row; smaller gaps lose precision through the fp16 shift. Measured at denoising step 49, the
+    positive-branch prediction is 5.7% from CPU FP32 with the ring kernel against 2.1% with an
+    exact softmax (diffusers' own BF16: 2.0%), 13% on the first latent frame.
+    """
+    return os.environ.get("WAN22_CP_RING_ATTENTION", "0") not in ("", "0")
+
+
 def wan_cp_self_attention(
     query,
     key,
@@ -817,6 +832,7 @@ def wan_cp_self_attention(
     cp_size,
     cp_group,
     cp_replica_groups,
+    real_len: int | None = None,
 ):
     """Context-parallel self-attention core, shared by the self-attention implementations.
 
@@ -824,12 +840,17 @@ def wan_cp_self_attention(
     ``[B, local_S, N, D]`` and returns the attention output **d-major** as
     ``[B, N, D, local_S]`` — the layout the o-projection kernels consume.
 
-    Ring attention on local K/V is the only path. Where the ring kernel cannot run (CPU mode,
-    fake-tensor tracing, NKI kernels disabled) it falls back to all-gathering K/V across the
-    CP group to the full sequence and running local flash attention — a capability check, not
-    a setting.
+    Default path: all-gather K/V across the CP group to the full sequence and run local flash
+    attention (``attention_cte``: true row maximum, FP32 softmax). The const-max ring kernel on
+    local K/V is opt-in only (:func:`cp_ring_attention_enabled`, which explains why) and needs the
+    kernel to be able to run (not CPU mode, fake-tensor tracing or NKI kernels disabled).
+
+    ``real_len`` (global, set when the sequence was padded up to a multiple of ``cp_size``)
+    keeps only the first ``real_len`` keys/values after the all-gather, so the trailing pad
+    tokens never enter a softmax. The ring kernel has no key mask, so a padded sequence always
+    takes the all-gather path.
     """
-    if cp_size > 1 and can_run_kernel(value):
+    if cp_size > 1 and real_len is None and cp_ring_attention_enabled() and can_run_kernel(value):
         # The ring kernel emits seq-major; transpose to the d-major contract here.
         ring_out = _nf_ring_attend(
             query,
@@ -846,10 +867,13 @@ def wan_cp_self_attention(
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
     if cp_size > 1:
-        # Fallback: all-gather K/V across the CP group to the full sequence
+        # All-gather K/V across the CP group to the full sequence
         # ([B, N, local_S, D] -> [B, N, S, D]), then local flash attention.
         key = cp_group.all_gather(key.contiguous(), dim=2)
         value = cp_group.all_gather(value.contiguous(), dim=2)
+        if real_len is not None and key.shape[2] > real_len:
+            key = key[:, :, :real_len].contiguous()
+            value = value[:, :, :real_len].contiguous()
     return _nki_attend(query, key, value, scale)
 
 
@@ -1033,6 +1057,8 @@ class WanSelfAttention(nn.Module):
         self.sp_enabled = tp_sequence_parallel
         self.sp_real_len: int | None = None
         self.sp_padded_len: int | None = None
+        # Global real sequence length when the CP split padded it (None = no CP padding).
+        self.cp_real_len: int | None = None
         self.num_heads = num_heads // tp_size
         tp_inner_dim = self.num_heads * head_dim
 
@@ -1130,6 +1156,7 @@ class WanSelfAttention(nn.Module):
             self.cp_size,
             self.cp_group,
             self.cp_replica_groups,
+            real_len=self.cp_real_len,
         )
 
         # wan_cp_self_attention returns d-major [B, N, D, S] — already the o-proj layout.
@@ -1457,11 +1484,22 @@ class WanTransformerBlock(nn.Module):
         # cache_dit may pass non-contiguous slices; make all inputs contiguous
         hidden_states = hidden_states.contiguous()
         temb = temb.contiguous()
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table + temb.float()
-        ).chunk(6, dim=1)
+        if temb.ndim == 4:
+            # Per-token modulation (TI2V with an image-conditioned first frame): temb is
+            # [B, S, 6, H], one AdaLN set per token. The fused AdaLN kernel takes per-batch
+            # [B, 1, H] modulation only, so these blocks use the unfused path.
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                mod.squeeze(2)
+                for mod in (self.scale_shift_table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
+            )
+            modulate = _eager_adaln
+        else:
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table + temb.float()
+            ).chunk(6, dim=1)
+            modulate = adaln_modulate
 
-        norm_h = adaln_modulate(
+        norm_h = modulate(
             hidden_states,
             1 + scale_msa,
             shift_msa,
@@ -1483,7 +1521,7 @@ class WanTransformerBlock(nn.Module):
                 self.norm2.bias,
                 self.norm2.eps,
             )
-        hidden_states, norm_h = adaln_modulate(
+        hidden_states, norm_h = modulate(
             attn1_out,
             norm2_w,
             norm2_b,
@@ -1501,7 +1539,7 @@ class WanTransformerBlock(nn.Module):
 
         # Fused AdaLN (norm3), with the attn2 (un-gated) residual add fused in: the kernel computes
         # ``hidden_states + attn2_out`` (gate=None) and normalizes it, row-packing for an FP8 FFN.
-        hidden_states, norm_h = adaln_modulate(
+        hidden_states, norm_h = modulate(
             attn2_out,
             1 + c_scale_msa,
             c_shift_msa,
@@ -1663,6 +1701,43 @@ class WanTransformer3DModel(nn.Module):
     def dtype(self) -> torch.dtype:
         return self.scale_shift_table.dtype
 
+    def _patch_embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Patchify + project to ``[B, S, inner]``: the patch Conv3d as one matmul.
+
+        Kernel == stride, so the Conv3d is exactly a linear layer over non-overlapping
+        ``C * pt * ph * pw`` patches (token order ``(f, h, w)``, as ``conv(...).flatten(2)``).
+        The explicit matmul sidesteps a neuronx-cc tensorizer failure on the Conv3d lowering
+        for short sequences (``NCC_INLA001``: invalid partition access in the patch conv).
+        """
+        conv = self.patch_embedding
+        p_t, p_h, p_w = conv.kernel_size
+        if tuple(conv.stride) != (p_t, p_h, p_w) or tuple(conv.padding) != (0, 0, 0):
+            return conv(x).flatten(2).transpose(1, 2)
+        b, c, f, h, w = x.shape
+        x = x.reshape(b, c, f // p_t, p_t, h // p_h, p_h, w // p_w, p_w)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(b, -1, c * p_t * p_h * p_w)
+        weight = conv.weight.reshape(conv.out_channels, -1).to(x.dtype)
+        bias = None if conv.bias is None else conv.bias.to(x.dtype)
+        return F.linear(x, weight, bias)
+
+    def _per_token_time_embedding(
+        self, timestep: torch.Tensor, like: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Time embedding for per-token timesteps ``[B, S]`` (TI2V image conditioning).
+
+        Returns ``temb`` ``[B, S, H]`` and the block modulation ``[B, S, 6, H]``, the same math
+        as Diffusers' ``timestep_seq_len`` path, computed for the given (rank-local) tokens.
+        """
+        emb = self.condition_embedder
+        batch, seq = timestep.shape
+        proj = emb.timesteps_proj(timestep.flatten()).unflatten(0, (batch, seq))
+        time_dtype = next(iter(emb.time_embedder.parameters())).dtype
+        if proj.dtype != time_dtype and time_dtype != torch.int8:
+            proj = proj.to(time_dtype)
+        temb = emb.time_embedder(proj).type_as(like)
+        timestep_proj = emb.time_proj(emb.act_fn(temb)).unflatten(2, (6, -1)).contiguous()
+        return temb, timestep_proj
+
     @staticmethod
     def _concat_encoder_context(
         encoder_hidden_states: torch.Tensor,
@@ -1743,6 +1818,10 @@ class WanTransformer3DModel(nn.Module):
         **kwargs,
     ) -> torch.Tensor | Transformer2DModelOutput:
         if getattr(self, "_lite_cache_dit_enabled", False):
+            if timestep.ndim == 2:
+                raise NotImplementedError(
+                    "Cache-DiT does not support per-token timesteps (TI2V image conditioning)"
+                )
             return self._forward_lite_cache_dit(
                 hidden_states,
                 timestep,
@@ -1755,17 +1834,21 @@ class WanTransformer3DModel(nn.Module):
 
         p_t, p_h, p_w = self.config.patch_size
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        # Per-token timesteps ([B, S], Wan2.2 TI2V with an image-conditioned first frame).
+        per_token_t = timestep.ndim == 2
         if timestep.shape[0] == 1 and batch_size > 1:
-            timestep = timestep.repeat(batch_size)
+            timestep = timestep.repeat(batch_size, *([1] * (timestep.ndim - 1)))
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
         rotary_emb = self.rope(hidden_states)
-        hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+        hidden_states = self._patch_embed(hidden_states)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
-                timestep,
+                # Per-token: embed a placeholder here; the real per-token modulation is built
+                # below from the rank-local token slice only.
+                timestep[:, 0] if per_token_t else timestep,
                 encoder_hidden_states,
                 encoder_hidden_states_image,
             )
@@ -1778,22 +1861,38 @@ class WanTransformer3DModel(nn.Module):
         )
 
         # >>> CP: Split sequence across CP ranks before transformer blocks <<<
+        S = hidden_states.shape[1]
+        cp_pad = 0
         if self.cp_size > 1:
-            S = hidden_states.shape[1]
-            if S % self.cp_size != 0:
-                raise ValueError(
-                    f"Sequence length {S} is not divisible by cp_size {self.cp_size}. "
-                    f"Choose a resolution/frame count that yields a divisible patch sequence length."
-                )
-            local_S = S // self.cp_size
+            # A sequence that does not split evenly over the CP group is padded at the end to the
+            # next multiple of cp_size. The pad tokens are excluded from every softmax as keys
+            # (see wan_cp_self_attention's ``real_len``) and dropped after the output all-gather,
+            # so the real tokens' result is exact; only the pad rows' own (discarded) outputs are
+            # garbage.
+            cp_pad = (-S) % self.cp_size
+            for block in self._wan_blocks:
+                block.attn1.cp_real_len = S if cp_pad else None
+            freqs_cos, freqs_sin = rotary_emb
+            if cp_pad:
+                hidden_states = F.pad(hidden_states, (0, 0, 0, cp_pad))
+                freqs_cos = F.pad(freqs_cos, (0, 0, 0, 0, 0, cp_pad))
+                freqs_sin = F.pad(freqs_sin, (0, 0, 0, 0, 0, cp_pad))
+                if per_token_t:
+                    timestep = F.pad(timestep, (0, cp_pad))
+            local_S = (S + cp_pad) // self.cp_size
             start = self.cp_rank * local_S
             hidden_states = hidden_states[:, start : start + local_S, :]
             # Slice rotary_emb to match local token positions
             # rotary_emb: (freqs_cos, freqs_sin) each [1, S, 1, D]
-            freqs_cos, freqs_sin = rotary_emb
             freqs_cos = freqs_cos[:, start : start + local_S, :, :]
             freqs_sin = freqs_sin[:, start : start + local_S, :, :]
             rotary_emb = (freqs_cos, freqs_sin)
+            if per_token_t:
+                timestep = timestep[:, start : start + local_S]
+
+        if per_token_t:
+            # The output norm runs on the CP-local sequence (before the CP all-gather).
+            temb, timestep_proj = self._per_token_time_embedding(timestep, encoder_hidden_states)
 
         if self.sp_enabled:
             S_cp = hidden_states.shape[1]
@@ -1805,6 +1904,11 @@ class WanTransformer3DModel(nn.Module):
             local_S = S_cp_padded // self.tp_size
             sp_start = self.tp_rank * local_S
             hidden_states = hidden_states[:, sp_start : sp_start + local_S, :]
+            if per_token_t:
+                # Blocks see the sequence-parallel slice; pad rows get a zero modulation.
+                if S_cp_padded > S_cp:
+                    timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, S_cp_padded - S_cp))
+                timestep_proj = timestep_proj[:, sp_start : sp_start + local_S]
 
         # The cache-generating first-step graph enters with no K/V and returns the
         # projections it creates. The steady-state graph enters with that cache and
@@ -1835,7 +1939,14 @@ class WanTransformer3DModel(nn.Module):
             hidden_states = hidden_states[:, :S_cp, :]
 
         # Output norm with scale/shift from temb
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+        if per_token_t:
+            # temb [B, S, H] -> per-token shift/scale [B, S, H]
+            shift, scale = (
+                mod.squeeze(2)
+                for mod in (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
+            )
+        else:
+            shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(
             hidden_states
@@ -1844,6 +1955,8 @@ class WanTransformer3DModel(nn.Module):
 
         if self.cp_size > 1:
             hidden_states = self.cp_group.all_gather(hidden_states.contiguous(), dim=1)
+            if cp_pad:
+                hidden_states = hidden_states[:, :S, :]
 
         # Unpatchify
         hidden_states = hidden_states.reshape(
@@ -1934,7 +2047,7 @@ class WanTransformer3DModel(nn.Module):
         if timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.repeat(batch_size)
         rotary_emb = self.rope(hidden_states)
-        hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+        hidden_states = self._patch_embed(hidden_states)
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
                 timestep,
@@ -1950,6 +2063,11 @@ class WanTransformer3DModel(nn.Module):
 
         if self.cp_size > 1:
             sequence_length = hidden_states.shape[1]
+            if sequence_length % self.cp_size:
+                raise NotImplementedError(
+                    f"Cache-DiT with CP needs a sequence divisible by cp_size; got "
+                    f"{sequence_length} tokens for cp_size {self.cp_size}"
+                )
             local_sequence_length = sequence_length // self.cp_size
             start = self.cp_rank * local_sequence_length
             hidden_states = hidden_states[:, start : start + local_sequence_length, :]
