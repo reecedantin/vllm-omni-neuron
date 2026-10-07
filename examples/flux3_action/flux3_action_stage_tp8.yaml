@@ -1,0 +1,26 @@
+# FLUX 3 Action served TP8 on eight cores (an adjacent chip pair). Set NEURON_VISIBLE_DEVICES to the eight
+# cores (and leave NEURON_RT_VISIBLE_CORES unset); devices below are logical indices into it.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Flux3ActionPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # Shared encoders (video VAE + Qwen3-VL text encoder) of black-forest-labs/flux-3-action-base:
+        # set flux3_action_base: <dir> or $FLUX3_ACTION_BASE for a local copy; otherwise the revision
+        # the policy config pins is read from the Hugging Face Hub (or its offline cache).
+        decode_frames: false
+        # VAE encoder on the NeuronCore (rank 0 under TP); "host" runs it on the CPU instead
+        vae_device: device
+        # caption encoder layers on the NeuronCore (over the TP group, cached per caption); "host" = CPU
+        text_encoder_device: device
+      parallel_config:
+        tensor_parallel_size: 8
