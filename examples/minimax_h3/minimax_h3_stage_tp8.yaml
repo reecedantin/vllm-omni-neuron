@@ -1,0 +1,26 @@
+# FastH3 / MiniMax-H3 (t2va) on Neuron (vLLM-Omni): TP=8 over one trn2 chip pair (8 logical NeuronCores at LNC=2).
+# The smallest layout; minimax_h3_stage_tp8cp4.yaml (TP=8 x CP=4, 32 cores) is about 1.8x faster per clip. The DiT is
+# compiled per geometry (prompt-length bucket x canvas x frames) on first use; later runs hit the NEFF cache.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      # logical indices into the visible cores (run.py maps an inherited NEURON_RT_VISIBLE_CORES pin onto
+      # NEURON_VISIBLE_DEVICES, which is what vLLM's multiprocess workers read)
+      devices: "0,1,2,3,4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: MiniMaxH3ModularPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # AdaLN modulation (13B params): "device" = column-parallel + all-gather on the NeuronCores,
+        # "host" = per-step tables computed on the host from the checkpoint (exact; frees ~24 GiB of HBM)
+        adaln: device
+        # Qwen3-VL-32B text encoder: "device" = TP over the stage's cores, "host" = the output rank's CPU
+        text_encoder: device
+      parallel_config:
+        tensor_parallel_size: 8
