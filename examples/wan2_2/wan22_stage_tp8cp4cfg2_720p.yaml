@@ -1,0 +1,30 @@
+# Wan2.2 T2V-A14B 720P (1280x720x81) on the whole trn2.48xlarge (64 logical NeuronCores, LNC=2):
+# TP=8 on an adjacent chip pair with sequence parallelism (40 heads -> 5 per rank), CP=4, and
+# CFG-parallel 2 (the conditional and unconditional branches run at the same time, 32 cores each).
+# Both experts stay resident at ~7.3 GB of weights per core. The TP4 x CP8 x CFG2 720P layout
+# (wan22_stage_tp4cp8cfg2_720p.yaml) does not fit trn2 HBM with the default CP self-attention.
+# devices index NEURON_VISIBLE_DEVICES.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63"
+      max_batch_size: 2
+    engine_args:
+      model_class_name: Wan22Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      boundary_ratio: 0.875
+      flow_shift: 5.0
+      skip_warmup: true
+      vae_use_tiling: true
+      model_config:
+        tp_sequence_parallel: true
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 4
+        cfg_parallel_size: 2
+        vae_patch_parallel_size: 32

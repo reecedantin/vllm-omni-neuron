@@ -47,6 +47,7 @@ import torch.distributed as dist
 from transformers import CLIPImageProcessor, CLIPVisionModel
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
@@ -55,7 +56,11 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
 )
 
 from vllm_omni_neuron.diffusion.distributed.cfg_parallel import NeuronCFGParallelMixin
-from vllm_omni_neuron.diffusion.models.wan2_2.pipeline_wan2_2 import NeuronWanPipeline
+from vllm_omni_neuron.diffusion.models.wan2_2 import _gate_dump
+from vllm_omni_neuron.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    NeuronWanPipeline,
+    _compile_lite_helper,
+)
 from vllm_omni_neuron.lite_compat import is_lite_runtime
 
 logger = logging.getLogger(__name__)
@@ -68,6 +73,35 @@ PIPELINE_REGISTRY = [
         "post_process_func_name": "get_wan22_i2v_post_process_func",
     },
 ]
+
+
+def broadcast_from_rank0(tensor: torch.Tensor, group) -> torch.Tensor:
+    """Broadcast rank 0's ``tensor`` (as host float32) over the gloo ``group``, shape included.
+
+    A gloo broadcast into a receive buffer of a different size does not fail: it fills the
+    buffer's leading elements and leaves the rest, so every rank must allocate rank 0's shape.
+    The placeholder a non-encoding rank builds may differ (TI2V: rank 0's condition latent has
+    one frame, the placeholder is full length), hence the shape goes first.
+    """
+    rank = dist.get_rank(group)
+    src = dist.get_global_rank(group, 0)
+    meta = torch.zeros(9, dtype=torch.int64)
+    if rank == 0:
+        meta[0] = tensor.ndim
+        meta[1 : 1 + tensor.ndim] = torch.tensor(tensor.shape, dtype=torch.int64)
+    dist.broadcast(meta, src=src, group=group)
+    shape = tuple(int(v) for v in meta[1 : 1 + int(meta[0])])
+    if rank == 0:
+        staged = tensor.detach().cpu().to(torch.float32).contiguous()
+    else:
+        staged = torch.empty(shape, dtype=torch.float32)
+    dist.broadcast(staged, src=src, group=group)
+    return staged
+
+
+def _ti2v_blend(mask, condition, latents):
+    """TI2V first-frame conditioning blend (upstream's arithmetic), in ``condition.dtype``."""
+    return ((1 - mask) * condition + mask * latents).to(condition.dtype)
 
 
 class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
@@ -100,6 +134,7 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
     _randn_latents = staticmethod(NeuronWanPipeline._randn_latents)
     _cast_device_dtype = NeuronWanPipeline._cast_device_dtype
     _decode_latents = NeuronWanPipeline._decode_latents
+    _perf_barrier = NeuronWanPipeline._perf_barrier
     _move_transformers_to = NeuronWanPipeline._move_transformers_to
     _clear_cross_attention_kv_cache = NeuronWanPipeline._clear_cross_attention_kv_cache
     _cross_attention_kv_entry_for = NeuronWanPipeline._cross_attention_kv_entry_for
@@ -222,8 +257,15 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
     def predict_noise(self, current_model=None, **kwargs):
         """Run I2V noise prediction with Lite-compatible tensor normalization."""
         timestep = kwargs["timestep"]
+        gate_step = _gate_dump.current_step()
+        _gate_dump.step_tensor(self, gate_step, "hidden_states", kwargs.get("hidden_states"))
+        _gate_dump.step_tensor(self, gate_step, "timestep", timestep)
         lite_runtime = is_lite_runtime()
-        if lite_runtime:
+        if lite_runtime and timestep.ndim == 2 and timestep.is_contiguous():
+            # Per-token timestep built on the host by :meth:`diffuse` (TI2V image conditioning):
+            # already a fresh contiguous device tensor; slicing it here would hand the DiT a view.
+            pass
+        elif lite_runtime:
             kwargs["timestep"] = (
                 timestep[0].unsqueeze(0)
                 if timestep.ndim == 1
@@ -253,7 +295,110 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
                 noise_pred = noise_pred[0]
             if not isinstance(noise_pred, torch.Tensor):
                 raise TypeError("Lite transformer output must resolve to a tensor")
+        _gate_dump.step_tensor(self, gate_step, "pred", noise_pred)
         return noise_pred
+
+    def diffuse(self, latents, timesteps, *args, **kwargs):
+        """Denoise loop. Wan2.1-style I2V (A14B) uses upstream's loop unchanged.
+
+        TI2V-5B image conditioning (``expand_timesteps``) differs from upstream only in WHERE
+        the per-token timestep is built: upstream slices the device mask every step
+        (``first_frame_mask[0][0][:, ::2, ::2] * t``), a strided eager view the Lite runtime
+        cannot feed a graph. Here the token mask is cut once on the host and each step's
+        ``[B, S]`` timestep is a fresh contiguous tensor moved to the device. The blend
+        ``(1 - mask) * condition + mask * latents`` is the same arithmetic as upstream.
+        """
+        if not self.expand_timesteps:
+            return super().diffuse(latents, timesteps, *args, **kwargs)
+        names = (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "image_embeds",
+            "guidance_low",
+            "guidance_high",
+            "boundary_timestep",
+            "dtype",
+            "attention_kwargs",
+            "condition",
+            "first_frame_mask",
+        )
+        a = dict(zip(names, args))
+        a.update(kwargs)
+        condition, first_frame_mask, dtype = a["condition"], a["first_frame_mask"], a["dtype"]
+        attention_kwargs = a["attention_kwargs"] or {}
+        _, p_h, p_w = self.transformer.config.patch_size
+        lat_h, lat_w = latents.shape[3], latents.shape[4]
+        # Token mask on the host: 0 for the conditioned first latent frame, 1 elsewhere
+        # (first_frame_mask is all ones except frame 0, so it is rebuilt rather than copied back).
+        num_latent_frames = latents.shape[2]
+        token_mask = torch.ones(num_latent_frames, lat_h // p_h, lat_w // p_w, dtype=torch.float32)
+        token_mask[0] = 0
+        token_mask = token_mask.flatten()
+        batch = latents.shape[0]
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for step_idx, t in enumerate(timesteps):
+                self._current_timestep = t
+                current_model = self.transformer
+                guidance = a["guidance_low"]
+                boundary = a["boundary_timestep"]
+                if boundary is not None and t < boundary and self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                    guidance = a["guidance_high"]
+                set_forward_context_denoise_step_idx(step_idx)
+                latent_model_input = self._ti2v_blend(first_frame_mask, condition, latents)
+                if latent_model_input.dtype != dtype:
+                    latent_model_input = self._cast_device_dtype(latent_model_input, dtype)
+                t_host = float(t.item()) if isinstance(t, torch.Tensor) else float(t)
+                timestep = (token_mask * t_host).unsqueeze(0).repeat(batch, 1).contiguous()
+                timestep = timestep.to(latents.device)
+                do_true_cfg = guidance > 1.0 and a["negative_prompt_embeds"] is not None
+                common = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states_image": a["image_embeds"],
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+                positive_kwargs = dict(common, encoder_hidden_states=a["prompt_embeds"])
+                negative_kwargs = (
+                    dict(common, encoder_hidden_states=a["negative_prompt_embeds"])
+                    if do_true_cfg
+                    else None
+                )
+                if step_idx < 2:
+                    self._i2v_dump(f"s{step_idx}_input", latent_model_input)
+                    self._i2v_dump(f"s{step_idx}_timestep", timestep)
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=guidance,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if step_idx < 2:
+                    self._i2v_dump(f"s{step_idx}_noise_pred", noise_pred)
+                    self._i2v_dump(f"s{step_idx}_latents", latents)
+                pbar.update()
+        # Return the blended latent in the condition's dtype: upstream ``forward`` blends once
+        # more, eagerly, and with equal dtypes that is an exact no-op (no eager promotion cast).
+        out = self._ti2v_blend(first_frame_mask, condition, latents)
+        self._i2v_dump("diffuse_out", out)
+        return out
+
+    def _ti2v_blend(self, mask, condition, latents):
+        """``(1 - mask) * condition + mask * latents`` in ``condition.dtype``, in one compiled
+        graph under Lite (an eager mixed-dtype op is a device cast the runtime rejects)."""
+        if not is_lite_runtime():
+            return _ti2v_blend(mask, condition, latents)
+        compiled = getattr(self, "_compiled_ti2v_blend", None)
+        if compiled is None:
+            from vllm_neuron.envs import get_compile_backend_name
+
+            compiled = _compile_lite_helper(_ti2v_blend, backend=get_compile_backend_name())
+            self._compiled_ti2v_blend = compiled
+        return compiled(mask, condition, latents)
 
     def scheduler_step_maybe_with_cfg(
         self,
@@ -265,6 +410,9 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
         generator=None,
     ):
         """Apply the scheduler step with Lite device-queue backpressure."""
+        gate_step = _gate_dump.current_step()
+        _gate_dump.step_tensor(self, gate_step, "noise_pred", noise_pred)
+        _gate_dump.step_tensor(self, gate_step, "latents", latents)
         latents = super().scheduler_step_maybe_with_cfg(
             noise_pred,
             t,
@@ -330,7 +478,8 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
             self.transformer.dtype if self.transformer is not None else torch.bfloat16
         )
 
-        if self.is_vae_rank:
+        encode_tile = self._condition_encode_tile()
+        if self.is_vae_rank and (encode_tile is None or self.is_output_rank):
             # Keep the condition inputs on the Neuron device so the VAE-encode runs
             # on-device via the compiled encoder. Down-cast to self.vae.dtype on CPU
             # before the transfer: upstream builds the pixel-space video_condition
@@ -340,9 +489,11 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
             # footprint that OOMs a VAE rank in fp32 at 720p. No arithmetic runs on
             # the image before the encode, so the encoder input is bit-identical; the
             # noise is still drawn separately in float32.
-            image = self._to_device_dtype(image, self.device, self.vae.dtype)
+            # Tiled condition encode (TI2V): the pixels stay on the host, tiles are cut there.
+            image_device = torch.device("cpu") if encode_tile is not None else self.device
+            image = self._to_device_dtype(image, image_device, self.vae.dtype)
             if last_image is not None:
-                last_image = self._to_device_dtype(last_image, self.device, self.vae.dtype)
+                last_image = self._to_device_dtype(last_image, image_device, self.vae.dtype)
             if self._collect_perf:
                 _t_enc = time.perf_counter()
             latents, condition, first_frame_mask = self._prepare_vae_i2v_latents(
@@ -353,12 +504,15 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
                 width=width,
                 num_frames=num_frames,
                 dtype=torch.float32,
-                device=self.device,
+                # Tiled (TI2V) path: the whole condition prep runs on the host and only the
+                # finished, contiguous tensors are moved below -- no eager device op touches them.
+                device=image_device,
                 generator=generator,
                 latents=latents,
                 last_image=last_image,
             )
             if self._collect_perf:
+                self._perf_barrier(condition)
                 self._vae_encode_seconds = time.perf_counter() - _t_enc
         else:
             latents, condition, first_frame_mask = self._empty_i2v_latents(
@@ -374,15 +528,28 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
             )
 
         if dist.is_initialized() and dist.get_world_size() > 1:
-            staged = condition.detach().cpu().to(torch.float32).contiguous()
-            dist.broadcast(staged, src=0, group=get_world_group().cpu_group)
-            condition = staged
+            condition = broadcast_from_rank0(condition, get_world_group().cpu_group)
 
         latents = self._to_device_dtype(latents, self.device, transformer_dtype)
         condition = self._to_device_dtype(condition, self.device, transformer_dtype)
         first_frame_mask = self._to_device_dtype(first_frame_mask, self.device, transformer_dtype)
 
+        self._i2v_dump("prep_latents", latents)
+        self._i2v_dump("prep_condition", condition)
+        self._i2v_dump("prep_mask", first_frame_mask)
         return latents, condition, first_frame_mask
+
+    def _i2v_dump(self, name, tensor):
+        """Debug: ``WAN22_I2V_DUMP=<dir>`` saves ``tensor`` (output rank, first request, first two
+        steps) as ``<dir>/<name>.pt`` in float32 on the host."""
+        root = os.environ.get("WAN22_I2V_DUMP")
+        if not root or not getattr(self, "is_output_rank", True):
+            return
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, f"{name}.pt")
+        if os.path.exists(path):
+            return
+        torch.save(tensor.detach().to("cpu").float().contiguous(), path)
 
     # ------------------------------------------------------------------
     # Forward
@@ -426,28 +593,38 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
         output_type = req.sampling_params.output_type
         req.sampling_params.output_type = "latent"
         self._clear_cross_attention_kv_cache()
+        _gate_dump.begin_request(self, req)
         try:
             result = super().forward(req)
         finally:
             self._clear_cross_attention_kv_cache()
             req.sampling_params.output_type = output_type
+        _gate_dump.rank_digest(self, getattr(result, "output", None))
+        if getattr(result, "output", None) is not None:
+            self._i2v_dump("forward_out", result.output)
         if self._collect_perf:
+            self._perf_barrier(getattr(result, "output", None))
             parent_forward_seconds = time.perf_counter() - t_parent_start
 
         # Offload DiT to CPU to free device memory for VAE (Trn2 VAE rank only).
-        if self._cpu_offload and self.is_vae_rank:
+        if self._cpu_offload and self.is_vae_rank and output_type != "latent":
             self._move_transformers_to(torch.device("cpu"))
 
         # VAE decode: only on the VAE rank(s); merged frames land on output rank.
         if self._collect_perf:
             t_vae_start = time.perf_counter()
         output = None
-        if self.is_vae_rank:
+        if output_type == "latent":
+            # Caller asked for latents (parity checks): skip the VAE decode.
+            if self.is_output_rank:
+                output = result.output.to("cpu")
+        elif self.is_vae_rank:
             decoded = self._decode_latents(result.output)
+            self._perf_barrier(decoded)
             if self.is_output_rank:
                 output = decoded
 
-        if self._cpu_offload and self.is_vae_rank:
+        if self._cpu_offload and self.is_vae_rank and output_type != "latent":
             self._move_transformers_to(self.device)
 
         if self._collect_perf:
@@ -544,12 +721,115 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
             device=device,
             dtype=dtype,
         )
-        first_frame_mask = torch.ones(
-            1, 1, num_latent_frames, latent_height, latent_width, device=device, dtype=dtype
-        )
         if self.expand_timesteps:
-            first_frame_mask[:, :, 0] = 0
+            # Built by concatenation: an in-place slice write on a device tensor is not
+            # supported by the Lite runtime (``Expected self.is_contiguous()``).
+            first_frame_mask = torch.cat(
+                [
+                    torch.zeros(1, 1, 1, latent_height, latent_width, device=device, dtype=dtype),
+                    torch.ones(
+                        1,
+                        1,
+                        num_latent_frames - 1,
+                        latent_height,
+                        latent_width,
+                        device=device,
+                        dtype=dtype,
+                    ),
+                ],
+                dim=2,
+            )
+        else:
+            first_frame_mask = torch.ones(
+                1, 1, num_latent_frames, latent_height, latent_width, device=device, dtype=dtype
+            )
         return latents, condition, first_frame_mask
+
+    # Wan2.2 TI2V-5B condition encode on Trn2. The compiled Wan2.2 encoder graph does not compile
+    # above 192 px (NCC_IDDT901), and the tiled device encode (192 px tiles, 96 px overlap) crashes
+    # the Neuron runtime on the output rank (``CreateSlice`` / ``nrt_tensor_get_size``). The
+    # default therefore encodes the single condition frame on the host with the reference
+    # diffusers VAE in fp32 (about 4 s at 1280x704 with 32 threads, exact upstream math);
+    # ``WAN22_ENCODE_DEVICE=tiled`` selects the tiled device encode, ``vae`` the VAE's own encode.
+    CONDITION_ENCODE_TILE = (192, 96)
+    HOST_ENCODE_THREADS = 32
+
+    def _condition_encode_mode(self) -> str | None:
+        """``"host"`` / ``"tiled"`` for the patchified Wan2.2 VAE (TI2V-5B), ``None`` for the
+        VAE's own encode (A14B, or ``WAN22_ENCODE_DEVICE=vae``)."""
+        if getattr(getattr(self, "vae", None), "config", None) is None:
+            return None
+        if self.vae.config.patch_size is None:
+            return None
+        mode = os.environ.get("WAN22_ENCODE_DEVICE", "host").strip().lower()
+        if mode not in ("host", "tiled", "vae"):
+            raise ValueError(f"WAN22_ENCODE_DEVICE: host, tiled or vae, got {mode!r}")
+        return None if mode == "vae" else mode
+
+    def _condition_encode_tile(self) -> tuple[int, int] | None:
+        """Non-``None`` when the condition is prepared on the host (host or tiled encode):
+        ``(tile_px, overlap_px)`` of the tiled encode, ``WAN22_ENCODE_TILE=<tile>,<overlap>``."""
+        if self._condition_encode_mode() is None:
+            return None
+        spec = os.environ.get("WAN22_ENCODE_TILE")
+        if spec:
+            tile, overlap = (int(v) for v in spec.split(","))
+            if not 0 <= overlap < tile:
+                raise ValueError(f"WAN22_ENCODE_TILE: need 0 <= overlap < tile, got {spec!r}")
+            return tile, overlap
+        return self.CONDITION_ENCODE_TILE
+
+    def _host_condition_vae(self):
+        vae = getattr(self, "_host_vae", None)
+        if vae is None:
+            from diffusers import AutoencoderKLWan
+
+            vae = AutoencoderKLWan.from_pretrained(
+                self.od_config.model, subfolder="vae", torch_dtype=torch.float32
+            ).eval()
+            self._host_vae = vae
+        return vae
+
+    def _encode_condition(self, video_condition: torch.Tensor) -> torch.Tensor:
+        """VAE-encode the pixel condition to its latent (the posterior mode, i.e. ``argmax``)."""
+        mode = self._condition_encode_mode()
+        if mode is None:
+            return retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+        x = video_condition.detach().cpu()
+        if mode == "host":
+            vae = self._host_condition_vae()
+            threads = torch.get_num_threads()
+            # Lite pins the worker to one thread; the host encode is 9x faster with 32.
+            torch.set_num_threads(max(threads, self.HOST_ENCODE_THREADS))
+            try:
+                with torch.no_grad():
+                    z = vae.encode(x.to(torch.float32)).latent_dist.mode()
+            finally:
+                torch.set_num_threads(threads)
+            return z.to(self.vae.dtype).contiguous()
+        from vllm_omni_neuron.diffusion.layers.vae_tiling import TileGrid, merge_tiles, run_tiles
+
+        tile_px, overlap_px = self._condition_encode_tile()
+        stride = tile_px - overlap_px
+        height, width = x.shape[-2:]
+        grid = TileGrid.for_axes(
+            total=(height, width),
+            tile=(tile_px, tile_px),
+            stride=(stride, stride),
+            in_scale=self.vae.spatial_compression_ratio,
+        )
+        xp = grid.pad_input(x)
+        # This process only (the output rank); the condition is broadcast afterwards.
+        tiles = run_tiles(
+            grid,
+            lambda n, idx: self.vae._tile_encode_one(grid.slice_input(xp, idx)),
+            world_size=1,
+            rank=0,
+        )
+        moments = merge_tiles(tiles, grid)
+        # DiagonalGaussianDistribution mode = mean. Materialize the channel slice on the host: a
+        # strided view moved to the device feeds a Lite graph a slice input.
+        return moments[:, : self.vae.config.z_dim].contiguous()
 
     def _prepare_vae_i2v_latents(
         self,
@@ -622,7 +902,10 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
                 dim=2,
             )
 
-        latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+        # ``video_condition`` is assembled from unsqueeze/cat (a non-contiguous view); the Lite
+        # VAE encoder's patchify requires a contiguous input (``Expected self.is_contiguous()``).
+        video_condition = video_condition.contiguous()
+        latent_condition = self._encode_condition(video_condition)
         if latent_condition.shape[0] != batch_size:
             latent_condition = torch.cat([latent_condition] * batch_size, dim=0)
 
@@ -735,8 +1018,22 @@ class NeuronWanI2VPipeline(NeuronCFGParallelMixin, Wan22I2VPipeline):
         return latents, condition, first_frame_mask
 
     def _to_device_dtype(self, tensor, device, dtype):
-        """Move to the target device, then cast via the shared Lite-aware helper."""
+        """Cast and move ``tensor``. A host tensor is cast on the host first (same rounding as a
+        device cast) and moved as one contiguous base tensor; only a tensor that is already on
+        the device goes through the shared Lite-aware compiled cast. The compiled cast must not
+        see a host tensor: under Lite it is a Neuron graph, and a host (or strided) input reaches
+        the runtime as a slice it cannot size (``nrt_tensor_get_size`` segfault)."""
         target_device = torch.device(device)
+        if target_device.type == "cpu" and tensor.device.type != "cpu":
+            # Device -> host (the upstream forward preprocesses the condition image on the
+            # device): copy first, then cast on the host. A device -> host copy of a view is fine
+            # under Lite; feeding the compiled cast a host tensor is not.
+            tensor = tensor.to(device=target_device)
+        if tensor.device.type == "cpu":
+            if tensor.dtype != dtype:
+                tensor = tensor.to(dtype=dtype)
+            tensor = tensor.contiguous()
+            return tensor if target_device.type == "cpu" else tensor.to(device=target_device)
         if tensor.device != target_device:
             tensor = tensor.to(device=target_device)
         return self._cast_device_dtype(tensor, dtype)

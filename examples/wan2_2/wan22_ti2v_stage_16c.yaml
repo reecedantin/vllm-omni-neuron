@@ -1,0 +1,27 @@
+# Wan2.2 TI2V-5B text-to-video, 16-core alternative to wan22_ti2v_stage.yaml (CFG runs sequentially):
+# one row of four Trn2 chips (16 logical NeuronCores, LNC=2):
+# TP=4 inside each chip with sequence parallelism (24 heads -> 6 per rank), CP=4 across the chips.
+# A sequence that does not divide by 4 (e.g. 832x480x81 = 8190 tokens) is padded and masked.
+# VAE decode is patch-parallel over all 16 ranks (vae_patch_parallel_size 16).
+# devices index NEURON_VISIBLE_DEVICES; for a single chip use --tp 4 --cp 1 --devices 0,1,2,3.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Wan22Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      flow_shift: 5.0
+      vae_use_tiling: true
+      model_config:
+        tp_sequence_parallel: true
+      parallel_config:
+        tensor_parallel_size: 4
+        ring_degree: 4
+        vae_patch_parallel_size: 16

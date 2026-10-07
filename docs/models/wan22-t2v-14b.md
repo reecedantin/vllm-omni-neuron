@@ -58,9 +58,23 @@ Per-model feature availability for Wan2.2-T2V-A14B. See the [README](https://git
 
 The recommended configuration runs on 64 NeuronCores (e.g., `trn3`), matching the [stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage.yaml): `tensor_parallel_size=4` × `ring_degree=8` (context parallelism) × `cfg_parallel_size=2` = 64.
 
+On **Trn2** (trn2.48xlarge, 64 logical NeuronCores at LNC=2, ~24 GB HBM each), the recommended **720P** configuration is
+[`wan22_stage_tp8cp4cfg2_720p.yaml`](../../examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml):
+`tensor_parallel_size=8` × `ring_degree=4` × `cfg_parallel_size=2` = 64, with both experts resident (~7.3 GB of
+weights per core). 1280x720x81, 40 steps: **157.8 s for a single warm request** (one request after compilation,
+not a median of repeated runs).
+
+The TP4 × CP8 × CFG2 720P config (`wan22_stage_tp4cp8cfg2_720p.yaml`) **does not fit Trn2 HBM with the current CP
+self-attention default and is not supported on Trn2**. Each core holds 14.7 GB of weights (both experts at TP4),
+1.5 GB of scratchpad, ~0.55 GB of code and runtime buffers, and 3.7 GB of DMA-ring spill per resident DiT graph;
+the pipeline keeps two DiT graphs resident (the first step computes the text cross-attention K/V, later steps reuse
+it), so loading the second graph needs ~24.4 GB against ~24 GB available, about 0.5 GB per core over. The full-sequence
+K/V all-gather of the current default adds ~0.4 GB per layer of transient scratch at this shape, compared with
+~0.1 GB for the ring kernel.
+
 CFG parallelism (size=2) runs the conditional and unconditional denoising passes across separate replicas in parallel, reducing wall-clock time per diffusion step.
 
-Context parallelism shards the sequence dimension (temporal-spatial latent tokens) across up to 8 ranks, enabling generation of longer videos within per-device HBM limits. The CP degree is configured with **`ring_degree`, not `sequence_parallel_size`**: vLLM Omni enforces `sequence_parallel_size = ulysses_degree * ring_degree`, so the stage config sets `ring_degree` and leaves `ulysses_degree` (default 1) and `sequence_parallel_size` unset — vLLM Omni then derives `sequence_parallel_size = 1 * ring_degree`. `ring_degree` sizes the sequence-parallel group; the CP self-attention itself runs ring attention (K/V stay sharded and are streamed around the CP group), falling back to all-gather + flash only where the ring kernel cannot run. See the [context parallelism design doc](../design/context_parallelism.md#configuration) for details.
+Context parallelism shards the sequence dimension (temporal-spatial latent tokens) across up to 8 ranks, enabling generation of longer videos within per-device HBM limits. The CP degree is configured with **`ring_degree`, not `sequence_parallel_size`**: vLLM Omni enforces `sequence_parallel_size = ulysses_degree * ring_degree`, so the stage config sets `ring_degree` and leaves `ulysses_degree` (default 1) and `sequence_parallel_size` unset — vLLM Omni then derives `sequence_parallel_size = 1 * ring_degree`. `ring_degree` sizes the sequence-parallel group; the CP self-attention all-gathers K/V across the group and runs flash attention with the true row maximum. The const-max ring-attention kernel (K/V stay sharded and are streamed around the CP group) is opt-in with `WAN22_CP_RING_ATTENTION=1`, because its static softmax bound can zero attention rows at the late, low-noise denoising steps. See the [context parallelism design doc](../design/context_parallelism.md#configuration) for details.
 
 Megatron sequence parallelism (SP) is layered **within** the TP group (orthogonal to CP): the normalization and MLP regions that TP would otherwise replicate are instead sharded along the sequence dimension across the TP ranks, cutting activation memory at large resolutions. It is enabled with `model_config.tp_sequence_parallel: true` (see the 720P config [`wan22_stage_tp4cp8cfg2_720p.yaml`](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml)) and requires `tensor_parallel_size > 1`. Leave it unset (the default) at 480P, where activations already fit.
 
@@ -91,11 +105,31 @@ low-noise DiT checkpoints.
 
 ## Accuracy Evaluation
 
+### Correctness on the current CP default
+
+The CP self-attention default changed from the const-max ring-attention kernel to K/V all-gather + flash
+attention with the true row maximum (see [Recommended configuration](#recommended-configuration)). Evidence
+for the current default, per layout:
+
+| Layout | Full-size run on the current default |
+|--------|--------------------------------------|
+| 480P, TP4 × CP8 × CFG2 (64 cores) | 81 frames, 40 steps: all 64 ranks produce the same final latent (one SHA-256), finite; frames visually clean |
+| 720P, TP8 × CP4 × CFG2 (64 cores, Trn2 recommended) | 81 frames, 40 steps: all 64 ranks produce the same final latent (one SHA-256), finite; frames visually clean (no zeroed rows or blocks, smooth frame-to-frame change) |
+| 720P, TP4 × CP8 × CFG2 (64 cores) | not supported on Trn2: does not fit HBM on the current default (see [Recommended configuration](#recommended-configuration)) |
+
+There is **no full-size CPU reference for the 14B models**, so these runs show that every rank agrees and the
+output is sound, not that it matches a reference. The evidence that the current default is the more accurate
+one is indirect, from Wan2.2-TI2V-5B (same Wan CP attention code): a CPU emulation of the ring kernel reproduces
+its device error and shows whole attention rows zeroed when the static softmax bound overshoots the true row
+maximum at late, low-noise steps; with the true row maximum the late-step error falls to the bf16 level, and
+the TI2V-5B teacher-forced step checks pass at 16 and 64 cores. On I2V-A14B 720P, the same seed on the two
+paths gives a smooth difference (per-frame SSIM mean 0.857), consistent with that per-step effect accumulating.
+
 **Benchmark:** [VBench](https://github.com/Vchitect/VBench) is a comprehensive benchmark suite for video generation models, evaluating across 16 dimensions including subject consistency, motion smoothness, temporal flickering, aesthetic quality, and imaging quality.
 
 See the [VBench paper](https://arxiv.org/abs/2311.17982) for the benchmark methodology.
 
-**Wan2.2-T2V-A14B-Diffusers (BF16)**
+**Wan2.2-T2V-A14B-Diffusers (BF16)**: measured with the previous ring-attention CP default; not re-measured with the current default (see [Correctness on the current CP default](#correctness-on-the-current-cp-default)).
 
 | Subtask and metric | Trn2 |
 |--------------------|------|

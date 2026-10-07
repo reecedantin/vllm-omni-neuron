@@ -9,6 +9,10 @@ from .pipeline_wan2_2 import (
     get_neuron_wan22_post_process_func,
     get_wan22_pre_process_func,
 )
+from .pipeline_wan2_2_dmd import (
+    PIPELINE_REGISTRY as _DMD_PIPELINES,
+)
+from .pipeline_wan2_2_dmd import NeuronWanDMDPipeline
 from .pipeline_wan2_2_i2v import (
     PIPELINE_REGISTRY as _I2V_PIPELINES,
 )
@@ -18,10 +22,11 @@ from .pipeline_wan2_2_i2v import (
     get_wan22_i2v_pre_process_func,
 )
 
-PIPELINE_REGISTRY = [*_T2V_PIPELINES, *_I2V_PIPELINES]
+PIPELINE_REGISTRY = [*_T2V_PIPELINES, *_I2V_PIPELINES, *_DMD_PIPELINES]
 
 __all__ = [
     "PIPELINE_REGISTRY",
+    "NeuronWanDMDPipeline",
     "NeuronWanI2VPipeline",
     "NeuronWanPipeline",
     "get_neuron_wan22_post_process_func",
