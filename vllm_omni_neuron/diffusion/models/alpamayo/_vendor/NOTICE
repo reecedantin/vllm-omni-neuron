@@ -1,0 +1,33 @@
+This directory vendors, with modifications, source from NVLabs' alpamayo1.5 repository:
+
+    https://github.com/NVlabs/alpamayo1.5
+    commit 36aeb4c (2026-09-09)
+    Apache License 2.0 (LICENSE in this directory)
+
+Files, and their origin under the upstream repo's `src/alpamayo1_5/`:
+
+    rotation.py                  <- geometry/rotation.py
+    action_space.py               <- action_space/action_space.py
+    action_space_utils.py         <- action_space/utils.py
+    unicycle_accel_curvature.py   <- action_space/unicycle_accel_curvature.py
+
+Modifications from the upstream source (every change is a dependency removal, not a behavior
+change -- verified bit-exact against upstream, see
+test/unit/test_alpamayo_action_space.py):
+
+* Internal imports rewritten from the `alpamayo1_5.*` package path to relative imports within this
+  `_vendor` package (these files are not installed as part of `alpamayo1_5`; they are copied here
+  so the Neuron plugin has no runtime dependency on that package, which pins Python 3.12 and needs
+  hydra/scipy -- see the model package's `config.py`).
+* `rotation.py`: `scipy.spatial.transform.Rotation` is now imported lazily inside `euler_2_so3`
+  (a numpy helper not used by any inference path in this plugin) instead of at module level, so
+  importing this module does not require scipy.
+* `action_space_utils.py`: six `einops.einsum("... i j, ... i k -> ... j k")` /
+  `einops.einsum("... i j, ... i -> ... j")` calls (least-squares normal-equation assembly in
+  `construct_DTD`, `dxy_theta_to_v_without_v0`, `dxy_theta_to_v`, `theta_smooth`) rewritten as the
+  equivalent explicit `.transpose(-1, -2) @ ...` batched matmuls, removing the `einops` dependency
+  (not available in the shared Neuron venv; a package request was not filed since the rewrite is
+  a direct, verified-equivalent substitution, not a new capability).
+
+Everything else is byte-for-byte identical to the upstream source, including comments and
+docstrings.

@@ -1,0 +1,23 @@
+# Alpamayo 2 Super (34B = 32B VLM + 2B expert) on Trainium2 (vLLM-Omni), tensor-parallel across
+# 8 NeuronCores (an adjacent chip pair, e.g. cores 8d..8d+7). At TP=8 each rank holds ~10.7 GB of
+# bf16 weights (64-layer, 5120-wide VLM text decoder: 64 q / 8 KV heads -> 8 q / 1 KV head per
+# rank); 4 cores would need ~19.4 GB of the 24 GB per core before KV cache and activations.
+#
+# With multi-process TP, `devices:` is a comma list of logical indices into NEURON_VISIBLE_DEVICES,
+# not a range; leave NEURON_RT_VISIBLE_CORES unset.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: actions
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Alpamayo2Super
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config: {}
+      parallel_config:
+        tensor_parallel_size: 8
