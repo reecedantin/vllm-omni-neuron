@@ -1,0 +1,19 @@
+# Qwen-Image 2.1 text-to-image on Neuron (vLLM-Omni), one Trainium2 chip at LNC=2: four logical
+# NeuronCores, tensor-parallel 4 for the Qwen3-VL text encoder and the DiT. The VAE decode deals its
+# 256px tiles across the 4 ranks. Warm 1024x1024 / 40 steps: 16.7 s. Graphs compile per shape on
+# first use; later runs hit the NEFF cache.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: QwenImage21Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      parallel_config:
+        tensor_parallel_size: 4

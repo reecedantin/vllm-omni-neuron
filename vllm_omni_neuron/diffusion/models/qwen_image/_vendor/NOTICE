@@ -1,0 +1,23 @@
+Qwen-Image 2.1 modeling code vendored from huggingface/diffusers
+================================================================
+
+The files in this directory are copied, unmodified except for import rewrites,
+from the Hugging Face Diffusers library:
+
+  Source:   https://github.com/huggingface/diffusers
+  Revision: 8b33bfc04b6b5e8bb58a58e55f68746c1bbee4cd
+  License:  Apache License 2.0
+
+  transformer_qwenimage21.py      <- src/diffusers/models/transformers/transformer_qwenimage21.py
+  autoencoder_kl_qwenimage21.py   <- src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py
+  pipeline_qwenimage21.py         <- src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py
+
+Local change: relative package imports (`from ...x`, `from ..x`) were rewritten
+to absolute `diffusers.*` / sibling imports so the modules load standalone. No
+functional changes.
+
+These files are the CPU reference for the Neuron implementation in the parent
+package. Remove them once a released diffusers version ships Qwen-Image 2.1.
+
+Copyright 2026 The HuggingFace Team. Licensed under the Apache License,
+Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).

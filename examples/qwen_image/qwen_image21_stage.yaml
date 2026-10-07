@@ -1,0 +1,22 @@
+# Qwen-Image 2.1 text-to-image on Neuron (vLLM-Omni), recommended: 16 NeuronCores (one row of four
+# Trainium2 chips at LNC=2), tensor-parallel 16 for the DiT (2 of 32 heads per rank) and the Qwen3-VL
+# text encoder (2 query heads per rank; its 8 KV heads are each replicated on 2 ranks). The VAE
+# decode deals its 256px tiles across all 16 ranks. Warm 1024x1024 / 40 steps: 7.2 s.
+# Fewer cores: qwen_image21_stage_tp8.yaml (10.5 s) or qwen_image21_stage_tp4.yaml (one chip, 16.7 s).
+# The text encoder, DiT prefix, DiT target and VAE graphs compile per shape on first use; later
+# runs hit the NEFF cache.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: QwenImage21Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      parallel_config:
+        tensor_parallel_size: 16
