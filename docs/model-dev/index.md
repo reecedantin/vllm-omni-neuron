@@ -33,6 +33,13 @@ Per-kernel implementation references for the Neuron-optimized kernels used by vL
 Reason about the three-stage cost model and choose a parallelism scheme to maximize quality per compute.
 :::
 
+:::{grid-item-card} Shared building blocks
+:link: shared-building-blocks
+:link-type: doc
+
+Kernel dispatch by NeuronCore generation, N-block graph splitting, host modulation tables, int8 weight-only linears, and prompt-embedding caching.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Onboarding a model <onboarding-models>
 Accuracy evaluation and debugging <accuracy-evaluation-debugging>
 Kernel implementations <kernels/index>
 Optimizing offline video generation <optimizing-offline-video-generation>
+Shared building blocks <shared-building-blocks>
 :::

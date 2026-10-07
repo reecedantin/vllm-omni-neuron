@@ -126,8 +126,14 @@ def _can_run_kernel_impl():
 
 
 def can_run_kernel(tensor):
-    """Run the import-safe kernel availability gate."""
-    return _can_run_kernel_impl()(tensor)
+    """Run the import-safe kernel availability gate.
+
+    NKI kernels need NeuronCore-v3+; vllm_neuron's gate only checks the device type, so on
+    Inf2/Trn1 (NeuronCore-v2) it would say yes and the kernel would fail to compile.
+    """
+    from vllm_omni_neuron.nc_generation import supports_nki
+
+    return supports_nki() and _can_run_kernel_impl()(tensor)
 
 
 # Logical NeuronCore (LNC) count each NKI launch spans via ``wrap_nki(kernel)[lnc]``. Its single

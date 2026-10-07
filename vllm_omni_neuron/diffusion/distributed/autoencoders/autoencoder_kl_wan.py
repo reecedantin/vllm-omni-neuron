@@ -36,6 +36,8 @@
 
 
 import math
+import os
+import types
 
 import nki
 import nki.language as nl
@@ -49,8 +51,6 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     AutoencoderKLWan,
     AvgDown3D,
     DupUp3D,
-    patchify,
-    unpatchify,
 )
 from diffusers.models.autoencoders.vae import (
     DecoderOutput,
@@ -77,14 +77,163 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 )
 
 from vllm_omni_neuron.lite_compat import (
+    get_platform_target,
     is_lite_runtime,
     nki_op,
     register_process_group_replica_groups,
 )
+from vllm_omni_neuron.nc_generation import supports_nki
 
 _VAE_ATTN_D_TILE_SIZE = 128
 _VAE_ATTN_PAD_HEAD_DIM = 512
 _VAE_ATTN_FLASH_THRESHOLD = 10 * 1024
+# nkilib attention_cte's head-dim ceiling (_MAX_HEAD_DIM). The Wan VAE attention is single-head with
+# head_dim = channels, so wider mid blocks (Wan2.2-TI2V-5B: 640 encoder / 1024 decoder) cannot use it.
+_VAE_ATTN_MAX_HEAD_DIM = 512
+
+
+def _vae_attn_can_use_nki(head_dim: int) -> bool:
+    """attention_cte for the VAE mid-block attention: NeuronCore-v3+ and head_dim <= 512."""
+    return supports_nki() and head_dim <= _VAE_ATTN_MAX_HEAD_DIM
+
+
+def _vae_attention_explicit(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Single-head attention ``(N, S, D)`` without NKI: QK^T in the input dtype, fp32 scale + softmax,
+    probabilities cast back for the PV matmul. Lowered by torch.compile on any NeuronCore."""
+    scores = torch.matmul(q, k.transpose(-1, -2)).float() * scale
+    return torch.matmul(torch.softmax(scores, dim=-1).to(v.dtype), v)
+
+
+def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Space-to-depth patchify, numerically identical to diffusers' ``patchify`` (verified bit-exact
+    for every patch size/shape in ``test/unit/test_wan_vae_platform.py``), but built from only
+    ADJACENT-axis ``transpose`` calls instead of one 7D ``permute(0, 1, 6, 4, 2, 3, 5)``.
+
+    Why: that permute's non-adjacent axis reordering compiles on Trn2 to a ``DramToDramTranspose``
+    the compiler rejects (``NCC_IDDT901`` assertion, every Wan2.2-5B-VAE encoder on NC-v3: Cosmos3
+    Edge/Nano/Super I2V + action heads, Wan TI2V I2V — the chunked ``NeuronWanEncoder3d`` graph that
+    runs patchify in-graph never compiled). A chain of single adjacent-axis transposes is the
+    pattern every NC-v2/NC-v3 transpose kernel in this codebase already relies on (see e.g. the VAE
+    attention padding and the Wan transformer's own axis juggling); it has never needed this
+    workaround, so prefer it over the general permute on-device.
+    """
+    if patch_size == 1:
+        return x
+    if x.dim() != 5:
+        raise ValueError(f"Invalid input shape: {x.shape}")
+    b, c, f, h, w = x.shape
+    if h % patch_size != 0 or w % patch_size != 0:
+        raise ValueError(
+            f"Height ({h}) and width ({w}) must be divisible by patch_size ({patch_size})"
+        )
+    # [b, c, f, h/p, p, w/p, p] (axes: b c f h' ph w' pw) -> walk pw to index 2, then ph to index 3,
+    # each step one adjacent swap -> [b, c, pw, ph, f, h', w'].
+    x = x.view(b, c, f, h // patch_size, patch_size, w // patch_size, patch_size)
+    for i in range(6, 2, -1):
+        x = x.transpose(i - 1, i)
+    for i in range(5, 3, -1):
+        x = x.transpose(i - 1, i)
+    x = x.contiguous()
+    return x.view(b, c * patch_size * patch_size, f, h // patch_size, w // patch_size)
+
+
+def unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Inverse of :func:`patchify`; same adjacent-transpose-chain construction, replacing diffusers'
+    ``permute(0, 1, 4, 5, 3, 6, 2)``. See :func:`patchify` for why."""
+    if patch_size == 1:
+        return x
+    if x.dim() != 5:
+        raise ValueError(f"Invalid input shape: {x.shape}")
+    b, c_patches, f, h, w = x.shape
+    c = c_patches // (patch_size * patch_size)
+    # [b, c, ph, pw, f, h, w] -> [b, c, f, h, pw, w, ph], one adjacent swap at a time.
+    x = x.view(b, c, patch_size, patch_size, f, h, w)
+    for i, j in ((3, 4), (2, 3), (4, 5), (3, 4), (4, 5), (5, 6)):
+        x = x.transpose(i, j)
+    x = x.contiguous()
+    return x.view(b, c, f, h * patch_size, w * patch_size)
+
+
+def _avg_down_3d_forward(self: AvgDown3D, x: torch.Tensor) -> torch.Tensor:
+    """Replacement for ``AvgDown3D.forward`` (diffusers): same adjacent-transpose-chain trick as
+    :func:`patchify`, this time for the encoder's space-to-depth-and-average downsample.
+
+    diffusers builds this with ``permute(0, 1, 3, 5, 7, 2, 4, 6)`` -- another non-adjacent 8D
+    permute, and the second ``DramToDramTranspose`` (``NCC_IDDT901``) found inside the Wan VAE
+    encoder on Trn2 after the ``patchify`` fix (the decoder, which uses :class:`DupUp3D` not this
+    class, compiled fine after the same patchify fix, isolating the remaining failure to the encoder's own
+    downsample). Bit-exact against the original on CPU for every tested shape.
+    """
+    pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
+    x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+    b, c, t, h, w = x.shape
+    # [b, c, t/ft, ft, h/fs, fs, w/fs, fs] -> [b, c, ft, fs_h, fs_w, t/ft, h/fs, w/fs], one adjacent
+    # swap at a time (replaces permute(0, 1, 3, 5, 7, 2, 4, 6)).
+    x = x.view(
+        b,
+        c,
+        t // self.factor_t,
+        self.factor_t,
+        h // self.factor_s,
+        self.factor_s,
+        w // self.factor_s,
+        self.factor_s,
+    )
+    for i, j in ((2, 3), (4, 5), (3, 4), (6, 7), (5, 6), (4, 5)):
+        x = x.transpose(i, j)
+    x = x.contiguous()
+    x = x.view(b, c * self.factor, t // self.factor_t, h // self.factor_s, w // self.factor_s)
+    x = x.view(
+        b,
+        self.out_channels,
+        self.group_size,
+        t // self.factor_t,
+        h // self.factor_s,
+        w // self.factor_s,
+    )
+    return x.mean(dim=2)
+
+
+def _dup_up_3d_forward(self: DupUp3D, x: torch.Tensor, first_chunk: bool = False) -> torch.Tensor:
+    """Replacement for ``DupUp3D.forward`` (diffusers): the decoder-side counterpart of
+    :func:`_avg_down_3d_forward`. The decoder already compiled on Trn2 before this change (its
+    graphs apparently never hit the width/shape combination that trips the compiler), but the same
+    non-adjacent permute (``permute(0, 1, 5, 2, 6, 3, 7, 4)``) is just as fragile in principle, so it
+    gets the identical, verified-bit-exact fix for consistency and future-proofing rather than being
+    left as the one remaining wide permute in this module.
+    """
+    x = x.repeat_interleave(self.repeats, dim=1)
+    x = x.view(
+        x.size(0),
+        self.out_channels,
+        self.factor_t,
+        self.factor_s,
+        self.factor_s,
+        x.size(2),
+        x.size(3),
+        x.size(4),
+    )
+    # [b, c, ft, fs_h, fs_w, t, h, w] -> [b, c, t, ft, h, fs_h, w, fs_w], one adjacent swap at a
+    # time (replaces permute(0, 1, 5, 2, 6, 3, 7, 4)).
+    for i, j in ((4, 5), (3, 4), (2, 3), (5, 6), (4, 5), (6, 7)):
+        x = x.transpose(i, j)
+    x = x.contiguous()
+    x = x.view(
+        x.size(0),
+        self.out_channels,
+        x.size(2) * self.factor_t,
+        x.size(4) * self.factor_s,
+        x.size(6) * self.factor_s,
+    )
+    if first_chunk:
+        x = x[:, :, self.factor_t - 1 :, :, :]
+    return x
+
+
+AvgDown3D.forward = _avg_down_3d_forward
+DupUp3D.forward = _dup_up_3d_forward
 
 
 def _should_pad_vae_attn_head_dim(seq_len: int, head_dim: int) -> bool:
@@ -319,19 +468,187 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 CACHE_T = 2
 
 
+def _own_code_object(fn, tag: str):
+    """Return ``fn`` rebuilt on a private copy of its code object.
+
+    Dynamo keys its compiled-frame cache (and the recompile limit) on the CODE object, so every
+    closure made from the same ``def`` shares one cache however different its captured constants
+    are. Giving each compiled graph its own code copy (``co_name`` tagged) gives it its own cache
+    entry list: one compile, no shared limit. Closure cells, globals and defaults are kept.
+    """
+    code = fn.__code__.replace(co_name=f"{fn.__code__.co_name}_{tag}")
+    return types.FunctionType(code, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
+
+
+# trn2.48xlarge collective routability (see diffusion/distributed/parallel_state.py): 16 chips in
+# a 4x4 torus, 4 logical cores per chip at LNC=2, rank r on chip r // 4. A collective is routable
+# iff its member chips form a torus ring -- one chip, a torus-adjacent pair (including the wrap),
+# a full row or column, or a rectangular block of them -- and every chip contributes the same
+# core offsets. Three chips in a line are a path, not a ring, and the fabric rejects them
+# ("no_hier no_mesh", surfacing as NRT_INVALID).
+_TRN2_CORES_PER_CHIP = 4
+_TRN2_CHIP_TORUS = (4, 4)
+_TORUS_CHECKED_PLATFORMS = frozenset({"trn2"})
+
+
+def _is_torus_ring_arc(values: list[int], ring: int) -> bool:
+    """``values`` (sorted, distinct, in ``range(ring)``) form a ring: all of it, one node, or two
+    torus-adjacent nodes (wrap included). Any other proper subset is a path."""
+    if len(values) in (1, ring):
+        return True
+    if len(values) != 2:
+        return False
+    first, second = values
+    return (second - first) % ring == 1 or (first - second) % ring == 1
+
+
+def gather_group_torus_routable(
+    ranks,
+    *,
+    cores_per_chip: int = _TRN2_CORES_PER_CHIP,
+    torus: tuple[int, int] = _TRN2_CHIP_TORUS,
+) -> bool:
+    """Whether a replica group of global ``ranks`` is routable on the trn2 chip torus.
+
+    Rank ``r`` sits on chip ``r // cores_per_chip`` and chips are numbered row-major on the
+    ``torus`` grid. Routable iff every chip contributes the same core offsets and the chip set is
+    a (cyclic) rectangle whose row set and column set are each a torus ring arc.
+    """
+    ranks = sorted({int(r) for r in ranks})
+    if not ranks:
+        return False
+    by_chip: dict[int, list[int]] = {}
+    for rank in ranks:
+        by_chip.setdefault(rank // cores_per_chip, []).append(rank % cores_per_chip)
+    chips = sorted(by_chip)
+    if len(chips) == 1:
+        return True
+    offsets = {tuple(sorted(o)) for o in by_chip.values()}
+    if len(offsets) != 1:
+        return False
+    torus_rows, torus_cols = torus
+    if chips[-1] >= torus_rows * torus_cols:
+        return False
+    rows = sorted({chip // torus_cols for chip in chips})
+    cols = sorted({chip % torus_cols for chip in chips})
+    if len(chips) != len(rows) * len(cols):
+        return False  # not a full rectangle of the row x column sets
+    return _is_torus_ring_arc(rows, torus_rows) and _is_torus_ring_arc(cols, torus_cols)
+
+
+VAE_GROUP_STRICT_ENV = "VLLM_OMNI_NEURON_VAE_GROUP_STRICT"
+
+
+def check_vae_group_covers_world(group_world: int, global_world: int | None) -> None:
+    """Warn (or refuse with ``VLLM_OMNI_NEURON_VAE_GROUP_STRICT=1``) when the VAE-parallel group is
+    smaller than the job.
+
+    A VAE group that excludes ranks is only correct if the excluded ranks never touch VAE outputs
+    themselves. In practice they do: an I2V pipeline encodes the conditioning image on every rank,
+    and a rank outside the group runs a different VAE object (different tiling, no group
+    collective) and gets different latents -- the CP slices then denoise against inconsistent
+    conditioning (observed as a visibly different clip, SSIM 0.94 vs the full-group run). The
+    executor cannot see what the excluded ranks do, so by default it warns; a pipeline that
+    guarantees the excluded ranks consume only broadcast results may keep the smaller group, and
+    one that cannot should set the strict env (or refuse itself, as the Cosmos3 port does)."""
+    if global_world is None or group_world >= global_world:
+        return
+    message = (
+        f"VAE patch-parallel group has {group_world} ranks but the job has {global_world}: ranks "
+        "outside the group must not encode/decode on their own (they would get different latents "
+        "than the group). Use vae_patch_parallel_size == world size, or broadcast every VAE result "
+        "to the excluded ranks."
+    )
+    if os.environ.get(VAE_GROUP_STRICT_ENV, "0") == "1":
+        raise RuntimeError(message)
+    logger.warning(message)
+
+
+def _axis_blend_plan(starts, stride, blend, total):
+    """Per-tile blend/crop plan along one axis, in output units: for tile ``k`` at ``starts[k]``,
+    ``(keep_offset, keep_len, blend_n, cur_offset, prev_offset)``. Tile ``k`` keeps the output from
+    where tile ``k-1``'s range ended to ``starts[k] + stride`` (the last tile: to ``total``); the
+    first ``blend_n = min(blend, keep_len)`` samples of that range ramp from tile ``k-1`` (read at
+    ``prev_offset`` inside it) into tile ``k`` (at ``cur_offset``). Evenly spaced starts give
+    diffusers' crop-to-stride and ``prev[-blend:]`` / ``cur[:blend]``; a last tile pulled back to
+    ``total - tile`` keeps only the remainder (same rule as ``vae_tiling.kept_ranges``)."""
+    plan = []
+    prev_end = 0
+    for k, start in enumerate(starts):
+        end = total if k == len(starts) - 1 else min(start + stride, total)
+        begin = prev_end
+        if begin < start:
+            raise ValueError(f"tile {k} starts at {start}, after the covered range ends ({begin})")
+        n = max(0, min(blend, end - begin)) if k > 0 else 0
+        prev_offset = begin - starts[k - 1] if k > 0 else 0
+        plan.append((begin - start, end - begin, n, begin - start, prev_offset))
+        prev_end = end
+    return tuple(plan)
+
+
+class _ShapeDispatchedGather:
+    """Callable standing in for one ``torch.compile``'d gather: compiles (and caches, through the
+    executor's ``_compile_device_graph``) one graph per input shape, each on its own code object,
+    and runs every call under ``no_grad`` so the grad mode never forces a recompile."""
+
+    def __init__(self, executor, fn):
+        self._executor = executor
+        self._fn = fn
+
+    def __call__(self, tensor):
+        graph = self._executor._compile_device_graph("gather", tuple(tensor.shape), self._fn)
+        with torch.no_grad():
+            return graph(tensor)
+
+
 class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
     """Route control metadata over CPU/Gloo and payload collectives over the device."""
 
     MAX_DEVICE_GATHER_BYTES = 512 * 1024 * 1024
+    # Env override of the per-chunk gather budget (MiB). The gathered chunk is resident on EVERY
+    # rank during the collective and on rank 0 during the blend, next to the DiT weights: a
+    # 32-rank TI2V/Cosmos3 decode at 512 MiB sat at 22.5 GB of 24 per core. Smaller chunks mean
+    # more collectives (each ~ms) and less HBM.
+    GATHER_BUDGET_ENV = "VLLM_OMNI_NEURON_VAE_GATHER_MB"
+
+    def gather_budget_bytes(self) -> int:
+        raw = os.environ.get(self.GATHER_BUDGET_ENV)
+        if raw:
+            try:
+                return max(1, int(raw)) * 1024 * 1024
+            except ValueError:
+                logger.warning("ignoring %s=%r (not an integer MiB)", self.GATHER_BUDGET_ENV, raw)
+        return self.MAX_DEVICE_GATHER_BYTES
 
     @staticmethod
     def _await_device_tensor(tensor):
-        """Wait for a device tensor without copying its payload to the host."""
+        """Wait for a device tensor without copying its payload to the host.
+
+        ``tensor`` must be a BASE tensor (``storage_offset() == 0``). The Lite runtime's
+        device-to-device ``copy_`` sizes the transfer as ``dst_bytes - src_storage_offset_bytes``,
+        so a one-element probe of a view that starts past the beginning of its storage asks NRT
+        for a negative byte count (``nrt_tensor_copy status=2`` / ``NRT_INVALID``, logged as
+        ``Cannot copy 18446744073642442754 bytes ... to dst tensor of size 2``). Refuse such a
+        view here, with the real reason, instead of letting the runtime report it in 2^64 form.
+        """
+        if tensor.device.type != "cpu" and tensor.storage_offset() != 0:
+            raise RuntimeError(
+                "_await_device_tensor needs a base device tensor (storage_offset 0), got a view "
+                f"at element offset {tensor.storage_offset()} of shape {tuple(tensor.shape)}: the "
+                "Lite device copy_ mis-sizes an offset source (nrt_tensor_copy NRT_INVALID)"
+            )
         source = tensor.view(-1)[:1]
         torch.empty_like(source).copy_(source)
 
     def _compile_device_graph(self, name, key, fn):
-        """Compile and cache a fixed-shape VAE payload graph."""
+        """Compile and cache a fixed-shape VAE payload graph.
+
+        Every graph gets its own Dynamo cache: the per-geometry closures compiled here
+        (``plane_chunk`` per chunk, ``slot_major`` per size, ``merge`` per grid) share ONE code
+        object each, and Dynamo caches compiled frames per code object with a recompile limit
+        (8 by default). A 64-rank decode cuts up to 7 chunks and a second resolution adds its own,
+        so without isolation the limit trips: ``FailOnRecompileLimitHit`` under ``fullgraph=True``
+        (verified on CPU at the 9th chunk). See :func:`_own_code_object`."""
         graphs = getattr(self, "_device_graphs", None)
         if graphs is None:
             graphs = {}
@@ -339,7 +656,7 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
         graph = graphs.get((name, key))
         if graph is None:
             graph = torch.compile(
-                fn,
+                _own_code_object(fn, f"{name}_{len(graphs)}"),
                 backend=get_compile_backend_name(),
                 fullgraph=True,
                 dynamic=False,
@@ -373,7 +690,8 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
 
     def _compiled_blend_graph(
         self,
-        slot_shapes,
+        gathered_shape,
+        tile_sources,
         grid_height,
         grid_width,
         heights,
@@ -385,49 +703,89 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
         blend_height,
         blend_width,
         clamp,
+        row_starts=None,
+        col_starts=None,
     ):
-        """Compile (cached) the tile blend for one plane chunk. Slots arrive
-        pre-sliced to ``[chunk_planes, H, W]``; keyed on shapes + geometry."""
+        """Compile (cached) the tile blend for one plane chunk.
 
-        def blend_vertical(above, tile):
-            weights = (
-                torch.arange(blend_height, device=tile.device, dtype=tile.dtype) / blend_height
-            ).reshape(blend_height, 1)
+        The single graph input is the gathered chunk ``[world, size, slots, H, W]`` (planes-major,
+        straight from the collective); ``tile_sources`` lists, in raster order, the ``(rank, slot)``
+        each grid tile lives at, and the graph takes the ``[rank, :, slot]`` view INSIDE itself. Keyed
+        on the gathered shape, the tile map and the geometry.
+
+        ``row_starts`` / ``col_starts`` (output units) place each tile; ``None`` means evenly spaced
+        (``k * stride``). Each tile owns the output from where the previous tile's range ended to its
+        own ``start + stride`` (the last: to the edge), and the first ``blend`` samples of that range
+        are diffusers' linear ramp against the (already blended) previous tile -- so a last tile
+        pulled back to end at the frame edge blends and crops correctly. On evenly spaced tiles this
+        is exactly diffusers' ``blend_v``/``blend_h`` + crop-to-stride."""
+        if row_starts is None:
+            row_starts = tuple(row * stride_height for row in range(grid_height))
+        if col_starts is None:
+            col_starts = tuple(column * stride_width for column in range(grid_width))
+        row_starts, col_starts = tuple(row_starts), tuple(col_starts)
+        row_plan = _axis_blend_plan(row_starts, stride_height, blend_height, full_height)
+        col_plan = _axis_blend_plan(col_starts, stride_width, blend_width, full_width)
+
+        def ramp(n, like, shape):
+            return (torch.arange(n, device=like.device, dtype=like.dtype) / n).reshape(shape)
+
+        def blend_vertical(above, tile, plan):
+            _, _, n, off_cur, off_prev = plan
+            if n <= 0:  # stride == tile size: abutting tiles, nothing to blend
+                return tile
+            weights = ramp(n, tile, (n, 1))
             blended = (
-                above[..., -blend_height:, :] * (1.0 - weights)
-                + tile[..., :blend_height, :] * weights
+                above[..., off_prev : off_prev + n, :] * (1.0 - weights)
+                + tile[..., off_cur : off_cur + n, :] * weights
             )
-            return torch.cat((blended, tile[..., blend_height:, :]), dim=-2)
+            parts = (tile[..., :off_cur, :], blended, tile[..., off_cur + n :, :])
+            return torch.cat([part for part in parts if part.shape[-2] > 0], dim=-2)
 
-        def blend_horizontal(left, tile):
-            weights = (
-                torch.arange(blend_width, device=tile.device, dtype=tile.dtype) / blend_width
-            ).reshape(1, blend_width)
-            blended = left[..., -blend_width:] * (1.0 - weights) + tile[..., :blend_width] * weights
-            return torch.cat((blended, tile[..., blend_width:]), dim=-1)
+        def blend_horizontal(left, tile, plan):
+            _, _, n, off_cur, off_prev = plan
+            if n <= 0:
+                return tile
+            weights = ramp(n, tile, (1, n))
+            blended = (
+                left[..., off_prev : off_prev + n] * (1.0 - weights)
+                + tile[..., off_cur : off_cur + n] * weights
+            )
+            parts = (tile[..., :off_cur], blended, tile[..., off_cur + n :])
+            return torch.cat([part for part in parts if part.shape[-1] > 0], dim=-1)
 
-        def merge(*slots):
+        def merge(gathered):
             blended_tiles = []
             rows = []
             for row in range(grid_height):
                 row_tiles = []
+                keep_top, keep_rows = row_plan[row][:2]
                 for column in range(grid_width):
                     index = row * grid_width + column
-                    tile = slots[index][..., : heights[row], : widths[column]]
+                    src_rank, src_slot = tile_sources[index]
+                    tile = gathered[src_rank, :, src_slot, : heights[row], : widths[column]]
                     if row > 0:
-                        tile = blend_vertical(blended_tiles[index - grid_width], tile)
+                        tile = blend_vertical(
+                            blended_tiles[index - grid_width], tile, row_plan[row]
+                        )
                         if column > 0:
                             tile = tile.clone(memory_format=torch.contiguous_format)
                     if column > 0:
-                        tile = blend_horizontal(blended_tiles[index - 1], tile)
+                        tile = blend_horizontal(blended_tiles[index - 1], tile, col_plan[column])
                     blended_tiles.append(tile)
-                    row_tiles.append(tile[..., :stride_height, :stride_width])
+                    keep_left, keep_cols = col_plan[column][:2]
+                    row_tiles.append(
+                        tile[
+                            ..., keep_top : keep_top + keep_rows, keep_left : keep_left + keep_cols
+                        ]
+                    )
                 rows.append(torch.cat(row_tiles, dim=-1))
             merged = torch.cat(rows, dim=-2)[..., :full_height, :full_width]
             return torch.clamp(merged, min=-1.0, max=1.0) if clamp else merged
 
         key = (
-            slot_shapes,
+            tuple(gathered_shape),
+            tuple(tile_sources),
             (grid_height, grid_width),
             heights,
             widths,
@@ -440,6 +798,8 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
                 blend_width,
                 clamp,
             ),
+            row_starts,
+            col_starts,
         )
         # Name stays "merge" so its compilation remains observable to tests.
         return self._compile_device_graph("merge", key, merge)
@@ -470,9 +830,19 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
         if local_planes.device.type == "cpu" or not is_lite_runtime():
             for start in starts:
                 size = min(chunk_planes, planes - start)
-                yield self.gather_tensors(local_planes.narrow(1, start, size).contiguous())
+                per_rank = self.gather_tensors(local_planes.narrow(1, start, size).contiguous())
+                if per_rank is None:
+                    yield None
+                    continue
+                # same planes-major [world, size, slots, H, W] layout the device gather produces
+                yield torch.stack(per_rank, dim=0).transpose(1, 2).contiguous()
             return
 
+        yield from self._stream_gather_planes_lite(local_planes, chunk_planes, planes, starts)
+
+    def _stream_gather_planes_lite(self, local_planes, chunk_planes, planes, starts):
+        """Device (Lite) branch of :meth:`_stream_gather_planes`; split out so the chunk/layout
+        logic is unit-testable on CPU with the compile and the collective stubbed."""
         setup_error = None
         try:
             compiled_gather = self._get_compiled_device_gather()
@@ -480,30 +850,103 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
             setup_error = error
         self._raise_if_device_gather_failed(setup_error, "setup")
 
-        # Every chunk is chunk_planes wide except a possible shorter tail, so only
-        # the full shape and (when it differs) the tail shape need precompiling.
+        # The plane chunk used to be local_planes.narrow(1, start, size).contiguous() -- an EAGER
+        # narrow + contiguous on a DEVICE tensor, which the Lite executor refuses ('Expected
+        # self.is_contiguous()'; seen on Wan2.2-TI2V-5B 704p patch-parallel decode). The first fix cut ALL chunks in ONE compiled multi-output graph
+        # (transpose -> split -> .contiguous() each). That breaks whenever ``slots == 1``: the
+        # transpose is then a pure re-labelling (a size-1 axis moves, the layout stays contiguous),
+        # ``torch.split`` yields contiguous views of the graph INPUT and ``.contiguous()`` is a
+        # no-op, so AOT autograd classifies every chunk as an alias of the input and hands back
+        # ``as_strided`` views of ``local_planes`` -- chunk k at element offset k*chunk_numel.
+        # The Lite device ``copy_`` then mis-sizes the one-element wait probe of any chunk after
+        # the first (see _await_device_tensor: 'Cannot copy 18446744073642442754 bytes ... dst
+        # tensor of size 2' = 2 - 2^26 bytes = exactly two 256-plane chunks at 256x256 bf16 for a
+        # 189-frame clip on 16 ranks; a 121-frame 704x1280 clip on 32 ranks hit 2 - 2^25).
+        # Multi-slot layouts (more tiles than ranks) and single-chunk payloads never aliased,
+        # which is why 16 ranks worked and 9-frame clips worked.
+        #
+        # Now: ONE compiled graph per chunk, whose only output is a ``clone`` -- a fresh,
+        # contiguous base tensor in every layout, including slots == 1 -- cut lazily right
+        # before its gather and dropped right after, so peak HBM is one chunk, not the whole
+        # payload twice. The gathered chunk is yielded planes-major, ``[world, size, slots, H, W]``
+        # (a reshape of the collective's output, no copy): the blend graph picks each tile's
+        # ``[rank, :, slot]`` view INSIDE its own graph, so the old slot-major restore copy -- a
+        # second budget-sized buffer resident on rank 0 next to the DiT weights -- is gone.
+        slots, _, height, width = local_planes.shape
+        world = self.world_size
+        planes_key = tuple(local_planes.shape)
+
+        def cut_chunk(
+            start, size
+        ):  # [slots, planes, H, W] -> [size, slots, H, W], fresh base tensor
+            def fn(t):
+                return (
+                    t.transpose(0, 1)
+                    .narrow(0, start, size)
+                    .clone(memory_format=torch.contiguous_format)
+                )
+
+            chunk = self._compile_device_graph("plane_chunk", (planes_key, start, size), fn)(
+                local_planes
+            )
+            self._check_gather_payload(chunk, (size, slots, height, width), local_planes)
+            self._await_device_tensor(chunk)
+            return chunk
+
+        # Every chunk is chunk_planes wide except a possible shorter tail, so only the full shape
+        # and (when it differs) the tail shape need precompiling. Cut those two chunks up front
+        # for the preflight and hand them to their own gather iteration below instead of cutting
+        # them twice (the tail stays resident until its turn: at most one extra chunk).
         sizes = [min(chunk_planes, planes)]
         tail = planes - starts[-1]
         if tail != sizes[0]:
             sizes.append(tail)
+        cut_ahead = {}
         preflight = []
         for size in sizes:
-            source = local_planes.narrow(1, 0, size).contiguous().reshape(-1)
+            index = 0 if size == sizes[0] else len(starts) - 1
+            cut_ahead[index] = cut_chunk(starts[index], size)
+            source = cut_ahead[index].reshape(-1)
             preflight.append((0, source.numel(), source))
         self._precompile_lite_device_gather(compiled_gather, preflight, local_planes)
         del preflight
 
         for chunk_index, start in enumerate(starts):
             size = min(chunk_planes, planes - start)
-            local_chunk = local_planes.narrow(1, start, size).contiguous()
+            local_chunk = cut_ahead.pop(chunk_index, None)
+            if local_chunk is None:
+                local_chunk = cut_chunk(start, size)
+            assert local_chunk.shape[0] == size, (local_chunk.shape, size)
             gathered = self._gather_chunk(compiled_gather, local_chunk.reshape(-1), chunk_index)
+            del local_chunk  # the gather holds its own copy; free the cut before the blend
             if gathered is None:
                 yield None
                 continue
-            chunk_views = list(gathered.reshape(self.world_size, *local_chunk.shape).unbind(0))
-            del gathered  # drop the alias; chunk_views still pins the storage
-            yield chunk_views
-            del chunk_views  # on resume, free the buffer before the next gather
+            yield gathered.reshape(world, size, slots, height, width)  # view, offset 0
+            del gathered  # on resume, free the buffer before the next gather
+
+    @staticmethod
+    def _check_gather_payload(chunk, shape, source):
+        """A chunk handed to the compiled gather must be a fresh contiguous base tensor of
+        ``shape``: not a view (storage offset 0) and not sharing storage with ``source`` -- the
+        aliasing that produced the negative-byte-count copy (see _stream_gather_planes_lite)."""
+        if tuple(chunk.shape) != tuple(shape):
+            raise RuntimeError(f"plane chunk has shape {tuple(chunk.shape)}, expected {shape}")
+        if not chunk.is_contiguous() or chunk.storage_offset() != 0:
+            raise RuntimeError(
+                "plane chunk is a strided/offset view "
+                f"(storage_offset={chunk.storage_offset()}, contiguous={chunk.is_contiguous()}); "
+                "the compiled cut must return a fresh base tensor"
+            )
+        if chunk._is_view() or chunk.untyped_storage() is source.untyped_storage():
+            raise RuntimeError(
+                "plane chunk aliases the local plane tensor; the compiled cut must clone, not view"
+            )
+        chunk_ptr = chunk.untyped_storage().data_ptr()  # 0 on Neuron tensors: then undecidable
+        if chunk_ptr and chunk_ptr == source.untyped_storage().data_ptr():
+            raise RuntimeError(
+                "plane chunk shares storage with the local plane tensor; the compiled cut must clone"
+            )
 
     def gather_and_blend_tiles(
         self,
@@ -519,15 +962,28 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
         blend_height,
         blend_width,
         clamp,
+        to_host=False,
+        row_starts=None,
+        col_starts=None,
     ):
         """All-gather and blend the padded tiles, streamed over plane chunks.
+
+        ``row_starts`` / ``col_starts``: each grid row's / column's start in output units (``None``:
+        evenly spaced, ``k * stride``). The decode split passes them so its full-size last tile,
+        pulled back to end at the frame edge, is placed and blended where it was cut.
 
         Instead of gathering the whole ``[world, slots, C, T, H, W]`` payload to
         rank 0 (~972 MiB at 720p, which OOMed the rank) then merging, this gathers
         only one channel*frame ("planes") slice at a time, blends it on rank 0, and
-        frees it before the next. Peak is one plane chunk plus the full output.
-        Every rank drives the per-chunk gather (collective); only rank 0 blends and
-        returns a tensor, others return ``None``.
+        frees it before the next. Every rank drives the per-chunk gather (collective); only
+        rank 0 blends and returns a tensor, others return ``None``.
+
+        Rank-0 HBM: one gathered chunk (<= :meth:`gather_budget_bytes`) plus, with
+        ``to_host=False``, the merged chunks and their final join (2x the output while
+        joining). With ``to_host=True`` each merged chunk is copied to the host as soon as it
+        is blended and the join happens there, so the device holds one gathered chunk and one
+        merged chunk at a time -- the mode for callers that move the result to the host anyway
+        (patchified VAEs unpatchify on the host). The other ranks hold nothing past the gather.
         """
         slots = local_tile_tensor.shape[0]
         slot_shape = tuple(local_tile_tensor.shape[1:])
@@ -544,9 +1000,7 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
         plane_bytes = (
             self.world_size * slots * slot_height * slot_width * local_tile_tensor.element_size()
         )
-        budget_planes = (
-            max(1, self.MAX_DEVICE_GATHER_BYTES // plane_bytes) if plane_bytes else planes
-        )
+        budget_planes = max(1, self.gather_budget_bytes() // plane_bytes) if plane_bytes else planes
         chunk_planes = max(1, min(planes, budget_planes))
 
         grid_height, grid_width = grid_spec.grid_shape
@@ -555,24 +1009,35 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
             if self.rank == 0
             else None
         )
-        heights = tuple(
-            min(slot_height, full_height - row * stride_height) for row in range(grid_height)
-        )
-        widths = tuple(
-            min(slot_width, full_width - column * stride_width) for column in range(grid_width)
-        )
+        if row_starts is None:
+            row_starts = tuple(row * stride_height for row in range(grid_height))
+        if col_starts is None:
+            col_starts = tuple(column * stride_width for column in range(grid_width))
+        row_starts, col_starts = tuple(row_starts), tuple(col_starts)
+        if len(row_starts) != grid_height or len(col_starts) != grid_width:
+            raise ValueError(
+                f"{len(row_starts)}x{len(col_starts)} tile starts for a "
+                f"{grid_height}x{grid_width} grid"
+            )
+        heights = tuple(min(slot_height, full_height - start) for start in row_starts)
+        widths = tuple(min(slot_width, full_width - start) for start in col_starts)
 
+        tile_sources = (
+            tuple(
+                coord_index[(row, column)]
+                for row in range(grid_height)
+                for column in range(grid_width)
+            )
+            if self.rank == 0
+            else None
+        )
         merged_chunks = []
         for gathered in self._stream_gather_planes(local_planes, chunk_planes, planes):
             if self.rank != 0:
                 continue
-            ordered = [
-                gathered[coord_index[(row, column)][0]][coord_index[(row, column)][1]]
-                for row in range(grid_height)
-                for column in range(grid_width)
-            ]
             blend = self._compiled_blend_graph(
-                tuple(tuple(tile.shape) for tile in ordered),
+                tuple(gathered.shape),
+                tile_sources,
                 grid_height,
                 grid_width,
                 heights,
@@ -584,16 +1049,22 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
                 blend_height,
                 blend_width,
                 clamp,
+                row_starts=row_starts,
+                col_starts=col_starts,
             )
-            merged = blend(*ordered)
+            merged = blend(gathered)
             self._await_device_tensor(merged)
+            if to_host and merged.device.type != "cpu":
+                merged = merged.to("cpu")  # base tensor (graph output): a plain D2H copy
             merged_chunks.append(merged)
-            del gathered, ordered  # free the gathered slice before the next chunk
+            del gathered  # free the gathered chunk before the next collective
 
         if self.rank != 0:
             return None
         if len(merged_chunks) == 1:
             result = merged_chunks[0]
+        elif merged_chunks[0].device.type == "cpu":
+            result = torch.cat(merged_chunks, dim=0)
         else:
 
             def join(*parts):
@@ -602,6 +1073,7 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
             shapes = tuple(tuple(part.shape) for part in merged_chunks)
             result = self._compile_device_graph("merge_join", shapes, join)(*merged_chunks)
             self._await_device_tensor(result)
+        del merged_chunks
         return result.reshape(*frame_shape, full_height, full_width)
 
     def execute(self, z, operator, broadcast_result=True):
@@ -638,6 +1110,46 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
             result = self._sync_final_result(result, z.ndim, z.device, output_dtype)
         return result
 
+    @staticmethod
+    def gather_replica_groups(world_size: int, global_world_size: int) -> list[list[int]]:
+        """The replica-group partition registered for the compiled VAE gather: the global world
+        split into consecutive blocks of ``world_size`` ranks (the VAE group is ranks
+        ``0..world_size-1``; the other blocks are its SPMD images). Pure, for unit tests."""
+        if world_size <= 0 or global_world_size % world_size != 0:
+            raise ValueError(
+                f"VAE gather group of {world_size} ranks does not divide a world of "
+                f"{global_world_size}"
+            )
+        return [
+            list(range(start, start + world_size))
+            for start in range(0, global_world_size, world_size)
+        ]
+
+    @staticmethod
+    def _check_gather_groups_routable(groups: list[list[int]], target: str | None = None) -> None:
+        """Refuse, with the reason, a VAE gather group the trn2 torus cannot route.
+
+        Without this the all-gather compiles and then every rank dies in NRT with a bare
+        ``NRT_INVALID``. ``target`` defaults to the detected Lite platform; the check only applies
+        to platforms whose topology is classified (``_TORUS_CHECKED_PLATFORMS``)."""
+        if target is None:
+            try:
+                target = get_platform_target()
+            except Exception:  # CPU host / undetectable platform: nothing to check against
+                return
+        if target not in _TORUS_CHECKED_PLATFORMS:
+            return
+        for group in groups:
+            if not gather_group_torus_routable(group):
+                raise RuntimeError(
+                    f"VAE patch-parallel gather group {group[0]}..{group[-1]} ({len(group)} ranks) "
+                    f"is not routable on the {target} chip torus: rank r is on chip r // "
+                    f"{_TRN2_CORES_PER_CHIP}, and the group's chips must form a torus ring (one "
+                    "chip, an adjacent pair, a full row of 4, or a block of full rows -- i.e. "
+                    "1-4, 8, 16, 32 or 64 ranks from rank 0). Lower vae_patch_parallel_size to "
+                    "one of those."
+                )
+
     def _get_compiled_device_gather(self):
         compiled_gather = getattr(self, "_compiled_device_gather", None)
         if compiled_gather is None:
@@ -655,25 +1167,22 @@ class _NeuronDistributedVaeExecutor(DistributedVaeExecutor):
                         "VAE process group must be a contiguous rank-0 group whose size "
                         "evenly divides the global world for Lite compilation"
                     )
-                register_process_group_replica_groups(
-                    group_name,
-                    [
-                        list(range(start, start + world_size))
-                        for start in range(0, global_world_size, world_size)
-                    ],
-                )
+                replica_groups = self.gather_replica_groups(world_size, global_world_size)
+                self._check_gather_groups_routable(replica_groups)
+                register_process_group_replica_groups(group_name, replica_groups)
 
             def device_gather(tensor):
                 gathered = funcol.all_gather_tensor(tensor, gather_dim=0, group=group)
                 return gathered.reshape(world_size, *tensor.shape)
 
-            compiled_gather = torch.compile(
-                device_gather,
-                backend=get_compile_backend_name(),
-                fullgraph=True,
-                dynamic=False,
-                options={"model_name": "wan_vae_gather"},
-            )
+            # One compiled graph PER CHUNK SHAPE, each on its own code object (via
+            # _compile_device_graph), instead of one torch.compile'd function recompiled for every
+            # new shape: Dynamo caps recompiles per code object at 8 (fullgraph -> hard failure),
+            # and a server that decodes several resolutions -- or a smoke that gathers a dozen chunk
+            # shapes -- walks past that ("Lite VAE device gather failed during compiled gather
+            # precompile", 8-rank smoke r3). The grad mode is pinned too: the precompile runs under
+            # no_grad and a differing grad mode at the real call was another recompile per shape.
+            compiled_gather = _ShapeDispatchedGather(self, device_gather)
             self._compiled_device_gather = compiled_gather
         return compiled_gather
 
@@ -1176,7 +1685,13 @@ class WanResample(nn.Module):
                     feat_idx[0] += 1
 
                     x = x.reshape(b, 2, c, t, h, w)
-                    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+                    # torch.stack over two advanced-indexed (non-contiguous) slices: the same
+                    # pattern that raised RuntimeError: Expected self.is_contiguous() on the real
+                    # device elsewhere in this fleet's code (neighborhood_attention's _window_axis,
+                    # fixed the same way) -- force each slice contiguous before stacking.
+                    x = torch.stack(
+                        (x[:, 0, :, :, :, :].contiguous(), x[:, 1, :, :, :, :].contiguous()), 3
+                    )
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
@@ -1311,10 +1826,22 @@ class WanAttentionBlock(nn.Module):
         # Single-head layout:
         # q/k/v: (B*T, S, C)
         qkv = qkv.reshape(B * T, 3, C, S)
-        qkv = qkv.permute(1, 0, 3, 2).contiguous()
+        # Single swap at a time (dim 0<->1, then dim 2<->3), not one combined permute([1,0,3,2]):
+        # same reasoning as patchify/AvgDown3D/DupUp3D's adjacent-transpose-chain fix elsewhere in
+        # this file -- a DramToDramTranspose (NCC_IDDT901) traced to the Cosmos3-Nano VAE encode
+        # geometry (base_dim 160, 640x640) persisted
+        # after those fixes, and this permute (already followed by .contiguous(), but combining two
+        # independent axis swaps in one call) was the next candidate on this exact code path.
+        qkv = qkv.transpose(0, 1).transpose(2, 3).contiguous()
         q, k, v = qkv.unbind(0)
 
-        if x.device.type == "neuron":
+        if x.device.type == "neuron" and not _vae_attn_can_use_nki(C):
+            # No NKI (NeuronCore-v2: Inf2/Trn1), or a channel width attention_cte cannot take
+            # (Wan2.2-TI2V-5B mid blocks: 640 / 1024 > its 512 head-dim limit): explicit
+            # fp32-softmax attention that torch.compile lowers (single head, one frame's spatial
+            # tokens per batch row).
+            out = _vae_attention_explicit(q, k, v, self.scale)
+        elif x.device.type == "neuron":
             # Keep scale based on the real Wan attention dim C.
             q = (q * self.scale).contiguous()
             k = k.contiguous()
@@ -1944,7 +2471,12 @@ class NeuronWanEncoder3d(nn.Module):
         self.encoder = encoder
         self.quant_conv = quant_conv
 
-    def forward(self, x_chunk, *flat_cache, first_chunk):
+    def forward(self, x_chunk, *flat_cache, first_chunk, patch_size=None):
+        # Wan2.2-TI2V-5B VAE: pixel -> patch layout (a per-frame space-to-depth) as part of the
+        # compiled graph, so the whole encode stays on the NeuronCore. Purely spatial, so doing
+        # it per temporal chunk equals patchifying the whole clip first.
+        if patch_size is not None:
+            x_chunk = patchify(x_chunk, patch_size=patch_size)
         feat_cache = list(flat_cache)
         feat_idx = [0]  # Explicit reset — don't rely on mutable default
         out = self.encoder(
@@ -2023,7 +2555,12 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
         scale_factor_temporal: int | None = 4,
         scale_factor_spatial: int | None = 8,
     ) -> None:
-        super().__init__()
+        # Skip AutoencoderKLWan.__init__: it is itself @register_to_config-decorated, so calling it
+        # with no arguments re-registers its Wan2.1 defaults over this class's config (z_dim 16,
+        # patch_size None, scale_factor_spatial 8, 16-channel latents_mean/std) and builds a
+        # throwaway default-size VAE. Harmless for Wan2.1 checkpoints, wrong for Wan2.2-TI2V-5B
+        # (Cosmos3-Edge): decode would skip unpatchify and de-normalise with the wrong statistics.
+        super(AutoencoderKLWan, self).__init__()
 
         self.z_dim = z_dim
         self.temperal_downsample = temperal_downsample
@@ -2308,125 +2845,80 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
             return (out,)
         return DecoderOutput(sample=out)
 
+    # Optional torch.distributed group over which tiled encode/decode deals tiles round-robin
+    # (vae_tiling.run_tiles). None = this rank runs every tile. Every rank in the group must call
+    # the same tiled_* method with the same input shape; only rank 0 of the group gets the result.
+    tile_parallel_group = None
+
+    def _graph_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        """Device/dtype the compiled graphs run on (the decoder's parameters)."""
+        p = next(self.decoder.parameters())
+        return p.device, p.dtype
+
+    def _tile_decode_one(self, tile_z: torch.Tensor) -> torch.Tensor:
+        """Decode one fixed-shape latent tile ``[B, C, T, th, tw]`` (a HOST tensor) frame by frame
+        through the two compiled decoder specializations with a per-tile feat_cache; returns the
+        pixel tile on CPU. Each frame is sliced on the host and moved whole, so every graph input is
+        a fresh contiguous device tensor -- an eager ``narrow``/``contiguous`` on a DEVICE tensor is
+        refused by this backend (``Expected self.is_contiguous()``, smoke round 13)."""
+        device, dtype = self._graph_device_dtype()
+        cache_ref = torch.empty(tile_z.shape, device=device, dtype=dtype)
+        feat_map = self._init_feat_cache(cache_ref)
+        frames = []
+        for k in range(tile_z.shape[2]):
+            frame = tile_z.narrow(2, k, 1).contiguous().to(dtype).to(device)
+            decoder = self._compiled_decoder_first if k == 0 else self._compiled_decoder_rest
+            result = decoder(frame, *feat_map, first_chunk=(k == 0))
+            feat_map = list(result[1:])
+            frames.append(result[0].cpu())
+        return torch.cat(frames, dim=2)
+
     def tiled_decode(
         self, z: torch.Tensor, return_dict: bool = True
     ) -> DecoderOutput | torch.Tensor:
-        r"""
-        Decode a batch of images using a tiled decoder.
+        r"""Spatially tiled decode through the compiled Neuron decoder, on the shared fixed-shape
+        tiling helper (:mod:`vllm_omni_neuron.diffusion.layers.vae_tiling`).
 
-        When the spatial dimensions of the latent tensor exceed the configured
-        tile thresholds (tile_sample_min_height/width ÷ spatial_compression_ratio),
-        this method splits the latent into overlapping spatial tiles, decodes each
-        tile frame-by-frame through the compiled Neuron decoder, and blends the
-        results back together using linear interpolation in the overlap regions.
+        Differences from diffusers' ``tiled_decode`` (and from this method's previous version):
 
-        Neuron-specific adaptations:
-        - Uses torch.index_select instead of Python slicing (z[:, :, :, i:j, k:l])
-            to avoid data-dependent slice bounds which may not lower correctly in
-            compiled Neuron graphs.
-        - Each tile gets its own feat_cache (via _init_feat_cache) sized to the
-            tile's spatial dimensions, ensuring correct cache shapes for compilation.
-        - Output frames are moved to CPU immediately to avoid accumulating device
-            memory across tiles and frames.
-
-        Algorithm:
-        1. Compute tile/stride/blend sizes in both latent and pixel space.
-        2. Iterate over spatial grid positions with stride < tile_size (overlap).
-        3. For each tile position, extract the latent tile and decode all temporal
-            frames sequentially (maintaining causal conv cache across frames).
-        4. After all tiles are decoded, blend overlapping regions:
-            - Vertical blending (blend_v): linear ramp along height overlap.
-            - Horizontal blending (blend_h): linear ramp along width overlap.
-        5. Crop each blended tile to stride dimensions and concatenate into the
-            full output tensor.
-
-        Args:
-            z (`torch.Tensor`): Input batch of latent vectors with shape
-                [B, C, T, H, W] where H and W are in latent space.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.vae.DecoderOutput`] or `tuple`:
-                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
-                returned.
+        * **Every tile has the same shape.** diffusers lets the last tile on each axis be narrower,
+          which on Neuron means a separate NEFF (a cold compile of minutes) per distinct tile shape,
+          times two decoder specializations. Here the last tile is pulled back to end at the
+          boundary, so exactly two graphs (first/rest frame) serve the whole grid at any resolution.
+          The blend reproduces diffusers' ``blend_v``/``blend_h`` ramps and crop-to-stride exactly
+          for the evenly spaced tiles; the pulled-back tile keeps only the remainder.
+        * **Static slicing.** Tiles are ``narrow`` views made contiguous before the graph boundary
+          -- no data-dependent ``index_select`` on the device, and every graph input is a
+          contiguous base tensor (the executor refuses strided views, smoke round 11).
+        * **Optional tile parallelism.** With :attr:`tile_parallel_group` set, tiles deal
+          round-robin across that group's ranks and gather to its rank 0; other ranks return ``None``.
         """
-        _, _, num_frames, height, width = z.shape
-        sample_height = height * self.spatial_compression_ratio
-        sample_width = width * self.spatial_compression_ratio
+        from vllm_omni_neuron.diffusion.layers.vae_tiling import TileGrid, merge_tiles, run_tiles
 
-        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
-        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
-        tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
-        tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
-        tile_sample_stride_height = self.tile_sample_stride_height
-        tile_sample_stride_width = self.tile_sample_stride_width
-        if self.config.patch_size is not None:
-            sample_height = sample_height // self.config.patch_size
-            sample_width = sample_width // self.config.patch_size
-            tile_sample_stride_height = tile_sample_stride_height // self.config.patch_size
-            tile_sample_stride_width = tile_sample_stride_width // self.config.patch_size
-            blend_height = (
-                self.tile_sample_min_height // self.config.patch_size - tile_sample_stride_height
-            )
-            blend_width = (
-                self.tile_sample_min_width // self.config.patch_size - tile_sample_stride_width
-            )
-        else:
-            blend_height = self.tile_sample_min_height - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width - tile_sample_stride_width
-
-        # Split z into overlapping tiles and decode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
-        rows = []
-        for i in range(0, height, tile_latent_stride_height):
-            row = []
-            for j in range(0, width, tile_latent_stride_width):
-                # Clamp start so tile doesn't exceed z bounds
-                hi = min(height, i + tile_latent_min_height)
-                wj = min(width, j + tile_latent_min_width)
-                h_indices = torch.arange(i, hi, device=z.device)
-                w_indices = torch.arange(j, wj, device=z.device)
-                tile_z = torch.index_select(z, 3, h_indices)
-                tile_z = torch.index_select(tile_z, 4, w_indices)
-                # Initialize feat_cache for this tile's spatial dimensions
-                feat_map = self._init_feat_cache(tile_z)
-
-                time = []
-                frame_indices = [torch.tensor([k], device=z.device) for k in range(num_frames)]
-                for k in range(num_frames):
-                    frame = torch.index_select(tile_z, 2, frame_indices[k])
-                    compiled_decoder = (
-                        self._compiled_decoder_first if k == 0 else self._compiled_decoder_rest
-                    )
-                    result = compiled_decoder(frame, *feat_map, first_chunk=(k == 0))
-                    out_frame = result[0]
-                    feat_map = list(result[1:])
-                    time.append(out_frame.cpu())
-                row.append(torch.cat(time, dim=2))
-            rows.append(row)
-
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_width)
-                result_row.append(
-                    tile[:, :, :, :tile_sample_stride_height, :tile_sample_stride_width]
-                )
-            result_rows.append(torch.cat(result_row, dim=-1))
-        dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
-
-        if self.config.patch_size is not None:
-            dec = unpatchify(dec, patch_size=self.config.patch_size)
-
+        _, _, _, height, width = z.shape
+        ratio = self.spatial_compression_ratio
+        p = self.config.patch_size
+        out_ratio = ratio if p is None else ratio // p  # decoder output is patchified when p is set
+        tile = (self.tile_sample_min_height // ratio, self.tile_sample_min_width // ratio)
+        stride = (self.tile_sample_stride_height // ratio, self.tile_sample_stride_width // ratio)
+        grid = TileGrid.for_axes(
+            total=(height, width), tile=tile, stride=stride, out_scale=out_ratio
+        )
+        # Tiles are cut on the HOST (one latent-sized transfer), then each frame of each tile goes
+        # to the device as a fresh contiguous tensor inside _tile_decode_one. Slicing a device
+        # tensor eagerly (narrow/index + contiguous) is what this backend refuses (round 13).
+        zp = grid.pad_input(z.detach().cpu())
+        tiles = run_tiles(
+            grid,
+            lambda n, idx: self._tile_decode_one(grid.slice_input(zp, idx)),
+            group=self.tile_parallel_group,
+        )
+        if tiles is None:  # a non-root rank of the tile-parallel group
+            return (None,) if not return_dict else DecoderOutput(sample=None)
+        dec = merge_tiles(tiles, grid)
+        if p is not None:
+            dec = unpatchify(dec, patch_size=p)
         dec = torch.clamp(dec, min=-1.0, max=1.0)
-
         if not return_dict:
             return (dec,)
         return DecoderOutput(sample=dec)
@@ -2467,17 +2959,26 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
         specializations that share one fixed-shape feat_cache set.
         """
         _, _, num_frame, height, width = x.shape
-
-        if self.config.patch_size is not None:
-            x = patchify(x, patch_size=self.config.patch_size)
+        p = self.config.patch_size
 
         tile_min_height = self.tile_sample_min_height
         tile_min_width = self.tile_sample_min_width
         if self.use_tiling and (width > tile_min_width or height > tile_min_height):
+            # raw pixels in: tiles are cut in pixel space and patchify runs inside the encoder
+            # graph per tile (NeuronWanEncoder3d.forward), exactly as the untiled path below.
             return self.tiled_encode(x)
 
         encoder = self._encoder_module()
-        feat_map = self._init_enc_feat_cache(x)
+        # Patchify (Wan2.2-TI2V-5B) runs inside the encoder graph, per chunk (see
+        # NeuronWanEncoder3d.forward); the feat_cache is sized for the patchified layout.
+        if p is not None:
+            b, c = x.shape[:2]
+            cache_ref = torch.empty(
+                b, c * p * p, 1, height // p, width // p, device=x.device, dtype=x.dtype
+            )
+        else:
+            cache_ref = x
+        feat_map = self._init_enc_feat_cache(cache_ref)
 
         iter_ = 1 + (num_frame - 1) // 4
         enc_chunks = []
@@ -2487,7 +2988,7 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
             else:
                 idx = torch.arange(1 + 4 * (i - 1), 1 + 4 * i, device=x.device)
             chunk = torch.index_select(x, 2, idx)
-            result = encoder(chunk, *feat_map, first_chunk=(i == 0))
+            result = encoder(chunk, *feat_map, first_chunk=(i == 0), patch_size=p)
             enc_chunks.append(result[0])
             feat_map = list(result[1:])
 
@@ -2512,76 +3013,57 @@ class NeuronAutoencoderKLWan(AutoencoderKLWan):
             return (posterior,)
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Tiled spatial encode through the compiled encoder.
-
-        Spatial analogue of :meth:`tiled_decode`: split the pixel input into
-        overlapping tiles, encode each tile's temporal chunks through the
-        compiled encoder with a per-tile fixed-shape feat_cache, then blend
-        overlaps on CPU. Returns the encoded latent tensor (the ``h`` fed to the
-        DiagonalGaussianDistribution), matching diffusers' ``tiled_encode``.
-        """
-        _, _, num_frames, height, width = x.shape
-
-        # Latent-space compression ratio (patchify pre-shrinks by patch_size).
-        encode_ratio = self.spatial_compression_ratio
-        if self.config.patch_size is not None:
-            encode_ratio = self.spatial_compression_ratio // self.config.patch_size
-
-        latent_height = height // encode_ratio
-        latent_width = width // encode_ratio
-
-        tile_latent_min_height = self.tile_sample_min_height // encode_ratio
-        tile_latent_min_width = self.tile_sample_min_width // encode_ratio
-        tile_latent_stride_height = self.tile_sample_stride_height // encode_ratio
-        tile_latent_stride_width = self.tile_sample_stride_width // encode_ratio
-        blend_height = tile_latent_min_height - tile_latent_stride_height
-        blend_width = tile_latent_min_width - tile_latent_stride_width
-
-        iter_ = 1 + (num_frames - 1) // 4
+    def _tile_encode_one(self, tile_x: torch.Tensor) -> torch.Tensor:
+        """Encode one fixed-shape pixel tile ``[B, C, T, th, tw]`` in diffusers' temporal chunks
+        (1 frame, then 4 at a time) through the encoder graph with a per-tile feat_cache; returns
+        the latent tile (the pre-split ``h``) on CPU. ``tile_x`` is a HOST tensor; chunks are sliced
+        on the host and moved whole (see :meth:`_tile_decode_one`)."""
+        device, dtype = self._graph_device_dtype()
+        p = self.config.patch_size
+        b, c, _, th, tw = tile_x.shape
+        if (
+            p is not None
+        ):  # patchify runs inside the encoder graph; the cache is sized post-patchify
+            cache_ref = torch.empty(b, c * p * p, 1, th // p, tw // p, device=device, dtype=dtype)
+        else:
+            cache_ref = torch.empty(b, c, 1, th, tw, device=device, dtype=dtype)
+        feat_map = self._init_enc_feat_cache(cache_ref)
         encoder = self._encoder_module()
+        chunks = []
+        for k in range(1 + (tile_x.shape[2] - 1) // 4):
+            start, length = (0, 1) if k == 0 else (1 + 4 * (k - 1), 4)
+            chunk = tile_x.narrow(2, start, length).contiguous().to(dtype).to(device)
+            result = encoder(chunk, *feat_map, first_chunk=(k == 0), patch_size=p)
+            chunks.append(result[0].cpu())
+            feat_map = list(result[1:])
+        return torch.cat(chunks, dim=2)
 
-        # Split x into overlapping pixel-space tiles and encode each separately.
-        rows = []
-        for i in range(0, height, self.tile_sample_stride_height):
-            row = []
-            for j in range(0, width, self.tile_sample_stride_width):
-                hi = min(height, i + self.tile_sample_min_height)
-                wj = min(width, j + self.tile_sample_min_width)
-                h_indices = torch.arange(i, hi, device=x.device)
-                w_indices = torch.arange(j, wj, device=x.device)
-                tile_x = torch.index_select(x, 3, h_indices)
-                tile_x = torch.index_select(tile_x, 4, w_indices)
+    def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatially tiled encode through the compiled encoder: the encode analogue of
+        :meth:`tiled_decode` on the same fixed-shape helper (pixel tiles in, latent tiles out via
+        ``in_scale``), so ONE encoder graph pair (first / steady chunk) serves every resolution and
+        the tile size can sit below the single-graph compile threshold
+        (Wan2.2-5B encoder on Trn2: 192 px OK, 208 px fails at the real width; set
+        ``tile_sample_min_*`` / ``tile_sample_stride_*`` accordingly). ``x`` is raw pixels: patchify
+        (when configured) runs inside the encoder graph per tile. Returns the latent ``h`` fed to
+        ``DiagonalGaussianDistribution`` (``None`` on a non-root tile-parallel rank)."""
+        from vllm_omni_neuron.diffusion.layers.vae_tiling import TileGrid, merge_tiles, run_tiles
 
-                feat_map = self._init_enc_feat_cache(tile_x)
-                time = []
-                for k in range(iter_):
-                    if k == 0:
-                        f_idx = torch.arange(0, 1, device=x.device)
-                    else:
-                        f_idx = torch.arange(1 + 4 * (k - 1), 1 + 4 * k, device=x.device)
-                    chunk = torch.index_select(tile_x, 2, f_idx)
-                    result = encoder(chunk, *feat_map, first_chunk=(k == 0))
-                    time.append(result[0].cpu())
-                    feat_map = list(result[1:])
-                row.append(torch.cat(time, dim=2))
-            rows.append(row)
-
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_width)
-                result_row.append(
-                    tile[:, :, :, :tile_latent_stride_height, :tile_latent_stride_width]
-                )
-            result_rows.append(torch.cat(result_row, dim=-1))
-
-        enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
-        return enc
+        _, _, _, height, width = x.shape
+        tile = (self.tile_sample_min_height, self.tile_sample_min_width)
+        stride = (self.tile_sample_stride_height, self.tile_sample_stride_width)
+        grid = TileGrid.for_axes(
+            total=(height, width), tile=tile, stride=stride, in_scale=self.spatial_compression_ratio
+        )
+        xp = grid.pad_input(x.detach().cpu())  # host-side tiling, see tiled_decode
+        tiles = run_tiles(
+            grid,
+            lambda n, idx: self._tile_encode_one(grid.slice_input(xp, idx)),
+            group=self.tile_parallel_group,
+        )
+        if tiles is None:
+            return None
+        return merge_tiles(tiles, grid)
 
 
 class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
@@ -2647,6 +3129,10 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
             self.distributed_executor.group = group
             self.distributed_executor.world_size = torch.distributed.get_world_size(group)
             self.distributed_executor.rank = torch.distributed.get_rank(group)
+        check_vae_group_covers_world(
+            self.distributed_executor.world_size,
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else None,
+        )
 
     def set_parallel_size(self, pp_size: int, mode: str = "tile") -> None:
         """Override to always use the executor's world_size as parallel size.
@@ -2690,9 +3176,23 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
             blend_height = self.tile_sample_min_height - tile_sample_stride_height
             blend_width = self.tile_sample_min_width - tile_sample_stride_width
 
+        # Every tile is full size: the last tile on each axis is pulled back to end at the frame
+        # edge (vae_tiling.tile_starts), as the single-process tiled_decode does. diffusers' grid
+        # (range(0, H, stride)) leaves thin edge tiles -- 2 latent rows / 4 columns at 256/224/192
+        # on a 30x52 latent -- which compile to their own decoder graphs and decoded with blocky
+        # right/bottom-edge noise on trn2 (Cosmos3 32-core decode, frames >= 17). A latent smaller
+        # than one tile is one tile of the latent's own size.
+        from vllm_omni_neuron.diffusion.layers.vae_tiling import tile_starts
+
+        latent_row_starts = tile_starts(height, tile_latent_min_height, tile_latent_stride_height)
+        latent_col_starts = tile_starts(width, tile_latent_min_width, tile_latent_stride_width)
+        out_ratio = self.spatial_compression_ratio
+        if self.config.patch_size is not None:
+            out_ratio //= self.config.patch_size  # decoder output is patchified
+
         tiletask_list = []
-        for i in range(0, height, tile_latent_stride_height):
-            for j in range(0, width, tile_latent_stride_width):
+        for row, i in enumerate(latent_row_starts):
+            for column, j in enumerate(latent_col_starts):
                 hi = min(height, i + tile_latent_min_height)
                 wj = min(width, j + tile_latent_min_width)
                 h_indices = torch.arange(i, hi, device=z.device)
@@ -2708,7 +3208,7 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
                 tiletask_list.append(
                     TileTask(
                         len(tiletask_list),
-                        (i // tile_latent_stride_height, j // tile_latent_stride_width),
+                        (row, column),
                         time_list,
                         workload=time_list[0].shape[3] * time_list[0].shape[4],
                     )
@@ -2720,6 +3220,9 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
             "blend_width": blend_width,
             "tile_sample_stride_height": tile_sample_stride_height,
             "tile_sample_stride_width": tile_sample_stride_width,
+            # tile starts in decoder-output units, for the start-aware blend
+            "row_starts": tuple(i * out_ratio for i in latent_row_starts),
+            "col_starts": tuple(j * out_ratio for j in latent_col_starts),
         }
         grid_spec = GridSpec(
             split_dims=(3, 4),
@@ -2760,11 +3263,16 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
         grid_spec: GridSpec,
         tid_coord_map: dict,
     ) -> torch.Tensor:
-        """Gather and blend decoded tiles into a full image on the Neuron device."""
-        if self.config.patch_size is not None:
-            raise NotImplementedError("Device VAE tile merge does not support patchified output")
+        """Gather and blend decoded tiles into a full image on the Neuron device.
+
+        Patchified VAEs (Wan2.2 / Cosmos3-Edge, ``patch_size`` set): tiles are decoded and blended
+        in the patchified layout -- ``tile_split`` already records strides/blends in those units,
+        exactly like diffusers' ``tiled_decode`` -- then the merged frame is unpatchified and
+        clamped once on the output rank.
+        """
+        patch = self.config.patch_size
         ts = grid_spec.tile_spec
-        return self.distributed_executor.gather_and_blend_tiles(
+        merged = self.distributed_executor.gather_and_blend_tiles(
             local_tile_tensor,
             meta_gather,
             grid_spec,
@@ -2775,8 +3283,19 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
             stride_width=ts["tile_sample_stride_width"],
             blend_height=ts["blend_height"],
             blend_width=ts["blend_width"],
-            clamp=True,
+            clamp=patch is None,
+            # Patchified output is unpatchified on the host anyway: stream each blended chunk to
+            # the host as it is made, so rank 0 never holds the whole merged video on the device.
+            to_host=patch is not None,
+            row_starts=ts.get("row_starts"),
+            col_starts=ts.get("col_starts"),
         )
+        if patch is None or merged is None:
+            return merged
+        # unpatchify is a view/permute chain the Neuron eager path rejects; the merged frames leave
+        # the device right after this anyway, so do it on the host.
+        merged = merged.to("cpu").contiguous()
+        return torch.clamp(unpatchify(merged, patch_size=patch), min=-1.0, max=1.0)
 
     def tiled_decode(
         self, z: torch.Tensor, return_dict: bool = True
@@ -2920,6 +3439,10 @@ class DistributedAutoencoderKLWan(NeuronAutoencoderKLWan, DistributedVaeMixin):
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
         if not self.is_distributed_enabled():
             return super().tiled_encode(x)
+        # The patch-parallel split/exec below works in the patchified layout (its encoder calls pass
+        # no patch_size); the base-class tiled path now takes raw pixels and patchifies in-graph.
+        if self.config.patch_size is not None:
+            x = patchify(x, patch_size=self.config.patch_size)
 
         # broadcast_result=True: every VAE rank calls encode inside the I2V
         # prepare_latents and continues to normalize / retrieve the latent, so

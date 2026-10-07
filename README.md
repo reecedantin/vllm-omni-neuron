@@ -1,7 +1,7 @@
 # vLLM Omni Neuron Plugin (Beta)
 
 The vLLM Omni Neuron plugin is the recommended serving solution for diffusion and
-multimodal generation models on AWS Trainium. It extends
+multimodal generation models on AWS Trainium and Inferentia2. It extends
 [vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) with a Neuron
 backend, providing the same vLLM Omni APIs and configuration you are already
 familiar with.
@@ -109,6 +109,10 @@ attention, fused adaptive LayerNorm with FP8 quantization, FP8 QKV
 projection, and FP8 MLP. It also calls kernels from the installed NKI Library
 for other attention, output-projection, and BF16 MLP paths. The vendored
 kernels can be read and adapted for other models.
+
+The bundled NKI Library kernels target NeuronCore-v3 and later (Trn2, Trn3).
+On NeuronCore-v2 (Inf2, Trn1), `vllm_omni_neuron/nc_generation.py` detects the
+generation and the shared layers route to their PyTorch paths instead.
 
 See the [vendored kernel reference](docs/model-dev/kernels/) for what each
 documented kernel computes, its design decisions, and how to adapt it to

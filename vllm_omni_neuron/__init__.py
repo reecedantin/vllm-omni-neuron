@@ -82,3 +82,13 @@ def _repair_neuron_device_module() -> None:
 
 
 _repair_neuron_device_module()
+
+
+def _install_hf_compat() -> None:
+    """Let vllm-omni discover diffusers modular checkpoints (``modular_model_index.json``)."""
+    from vllm_omni_neuron.hf_compat import install_modular_model_index_fallback
+
+    install_modular_model_index_fallback()
+
+
+_install_hf_compat()
