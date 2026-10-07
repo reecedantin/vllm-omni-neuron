@@ -67,7 +67,7 @@ The I2V stage config carries a few model-specific engine args beyond the T2V sta
 
 CFG parallelism (size=2) runs the conditional and unconditional denoising passes across separate replicas in parallel, reducing wall-clock time per diffusion step.
 
-Context parallelism shards the sequence dimension (temporal-spatial latent tokens) across up to 8 ranks, enabling generation of longer videos within per-device HBM limits. The CP degree is configured with **`ring_degree`, not `sequence_parallel_size`**: vLLM Omni enforces `sequence_parallel_size = ulysses_degree * ring_degree`, so the stage config sets `ring_degree` and leaves `ulysses_degree` (default 1) and `sequence_parallel_size` unset — vLLM Omni then derives `sequence_parallel_size = 1 * ring_degree`. `ring_degree` sizes the sequence-parallel group; the CP self-attention itself runs ring attention (K/V stay sharded and are streamed around the CP group), falling back to all-gather + flash only where the ring kernel cannot run. See the [context parallelism design doc](../design/context_parallelism.md#configuration) for details.
+Context parallelism shards the sequence dimension (temporal-spatial latent tokens) across up to 8 ranks, enabling generation of longer videos within per-device HBM limits. The CP degree is configured with **`ring_degree`, not `sequence_parallel_size`**: vLLM Omni enforces `sequence_parallel_size = ulysses_degree * ring_degree`, so the stage config sets `ring_degree` and leaves `ulysses_degree` (default 1) and `sequence_parallel_size` unset — vLLM Omni then derives `sequence_parallel_size = 1 * ring_degree`. `ring_degree` sizes the sequence-parallel group; the CP self-attention all-gathers K/V across the group and runs flash attention with the true row maximum. The const-max ring-attention kernel (K/V stay sharded and are streamed around the CP group) is opt-in with `WAN22_CP_RING_ATTENTION=1`, because its static softmax bound can zero attention rows at the late, low-noise denoising steps. See the [context parallelism design doc](../design/context_parallelism.md#configuration) for details.
 
 Megatron sequence parallelism (SP) is layered **within** the TP group (orthogonal to CP): the normalization and MLP regions that TP would otherwise replicate are instead sharded along the sequence dimension across the TP ranks, cutting activation memory. It is enabled with `model_config.tp_sequence_parallel: true` and requires `tensor_parallel_size > 1`.
 
@@ -77,12 +77,31 @@ The conditioning image is passed through `multi_modal_data` (`{"image": <PIL.Ima
 
 ## Accuracy Evaluation
 
+### Correctness on the current CP default
+
+The CP self-attention default changed from the const-max ring-attention kernel to K/V all-gather + flash
+attention with the true row maximum (see [Recommended configurations](#recommended-configurations)). Evidence
+for the current default, per layout:
+
+| Layout | Full-size run on the current default | Compared with the previous ring default (same seed) |
+|--------|--------------------------------------|-----------------------------------------------------|
+| 480P, TP4 × CP8 × CFG2 (64 cores) | 81 frames, 40 steps: all 64 ranks produce the same final latent (one SHA-256), finite; frames visually clean | not re-run |
+| 720P, TP8 × CP4 (32 cores) | 81 frames, 40 steps: all 32 ranks produce the same final latent, finite; frames visually clean | latent rel-L2 18.3%; per-frame SSIM mean 0.857, min 0.784, declining smoothly from 0.966 at the conditioning frame |
+
+There is **no full-size CPU reference for the 14B models**, so these runs show that every rank agrees and the
+output is sound, not which attention path is closer to the reference. The evidence that the current default is
+the more accurate one is indirect, from Wan2.2-TI2V-5B (same Wan CP attention code): a CPU emulation of the ring
+kernel reproduces its device error and shows whole attention rows zeroed when the static softmax bound
+overshoots the true row maximum at late, low-noise steps; with the true row maximum the late-step error falls
+to the bf16 level, and the TI2V-5B teacher-forced step checks pass at 16 and 64 cores. The difference above is
+the 40-step accumulation of that per-step effect.
+
 **Benchmark:** [VBench-I2V](https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v) is the image-to-video track of [VBench](https://github.com/Vchitect/VBench), a comprehensive benchmark suite for video generation models. It scores generation quality (subject/background consistency, motion smoothness, dynamic degree, aesthetic quality, imaging quality) alongside how faithfully the video preserves the conditioning frame and camera motion (the I2V dimensions).
 
 See the [VBench paper](https://arxiv.org/abs/2311.17982) for the original benchmark
 and the [VBench++ paper](https://arxiv.org/abs/2411.13503) for its image-to-video extension.
 
-**Wan2.2-I2V-A14B-Diffusers (BF16), 480p**
+**Wan2.2-I2V-A14B-Diffusers (BF16), 480p**: measured with the previous ring-attention CP default; not re-measured with the current default (see [Correctness on the current CP default](#correctness-on-the-current-cp-default)).
 
 | Platform | Total Score | Quality Score | I2V Score |
 |----------|-------------|---------------|-----------|
