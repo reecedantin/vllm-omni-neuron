@@ -19,6 +19,13 @@ Text-to-video recipe for WAN 2.2 A14B on Trainium.
 Image-to-video recipe for WAN 2.2 A14B on Trainium.
 :::
 
+:::{grid-item-card} Cosmos3-Edge
+:link: cosmos3-edge
+:link-type: doc
+
+NVIDIA Cosmos3-Edge world model on Inferentia2: text/image-to-video, text-to-image, robot policy and dynamics.
+:::
+
 ::::
 
 :::{toctree}

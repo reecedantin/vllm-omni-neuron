@@ -1,0 +1,7 @@
+Files in this directory are vendored from vLLM-Omni
+(https://github.com/vllm-project/vllm-omni, commit dff28e686711add0e929ce0c5660b09ef26c8c88),
+licensed under the Apache License, Version 2.0. Copyright contributors to the vLLM project.
+
+The pinned vllm-omni==0.24.0 predates Cosmos3-Edge. Local patches: imports of the flow-match
+scheduler, the cache-dit adapter config and the world-model session state are routed through
+_compat.py and a local copy of scheduling_flow_match_euler_discrete.py; session state is disabled.

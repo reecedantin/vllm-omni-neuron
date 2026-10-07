@@ -1,1 +1,8 @@
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+vllm_omni_neuron/diffusion/models/cosmos3_edge/_vendor/
+  Cosmos3 / Cosmos3-Edge modeling code vendored from vLLM-Omni
+  (https://github.com/vllm-project/vllm-omni, commit dff28e686711add0e929ce0c5660b09ef26c8c88),
+  Apache-2.0. The pinned vllm-omni==0.24.0 predates Cosmos3-Edge. Local patches: imports of the
+  flow-match scheduler, cache-dit adapter config and world-model session state are routed through
+  _vendor/_compat.py and a local scheduler copy; session state is disabled.
