@@ -1,0 +1,22 @@
+# pi0 (base) on two NeuronCores: the PaliGemma LM (action prefix) tensor-parallel over TP=2, with
+# the SigLIP vision tower and the action expert replicated on both ranks. Use two logical cores of
+# one chip. See pi0_stage.yaml for the single-core layout.
+#
+#   python examples/pi0/run.py --model lerobot/pi0_base --stage-config examples/pi0/pi0_stage_tp2.yaml
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: action
+    runtime:
+      process: true
+      devices: "0,1"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Pi0Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        tokenizer: google/paligemma-3b-pt-224
+      parallel_config:
+        tensor_parallel_size: 2
