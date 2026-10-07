@@ -37,7 +37,15 @@ from ._vendor.transformer_cosmos3 import (
     _apply_rotary_pos_emb,
 )
 from .attention import edge_attention, key_padding_bias
-from .und_tower import EdgeTextConfig, _sharded, _tp_state, rms_norm
+from .und_tower import (
+    EdgeTextConfig,
+    _param,
+    _sharded,
+    _tp_state,
+    attach_tp_loaders,
+    mlp_forward,
+    rms_norm,
+)
 
 
 class EdgeGenConfig(EdgeTextConfig):
@@ -54,7 +62,9 @@ class EdgeGenConfig(EdgeTextConfig):
         self.base_fps = float(cfg.get("base_fps", 24.0))
         self.temporal_compression_factor = int(cfg.get("temporal_compression_factor", 4))
         self.enable_fps_modulation = bool(cfg.get("enable_fps_modulation", True))
-        self.temporal_modality_margin = int(cfg.get("unified_3d_mrope_temporal_modality_margin", 15000))
+        self.temporal_modality_margin = int(
+            cfg.get("unified_3d_mrope_temporal_modality_margin", 15000)
+        )
         self.sound_latent_fps = cfg.get("sound_latent_fps", 25)
 
     @classmethod
@@ -70,6 +80,35 @@ def timestep_embedding_freqs(dim: int = 256, max_period: int = 10000) -> torch.T
     return torch.exp(-math.log(max_period) * torch.arange(0, half, dtype=torch.float32) / half)
 
 
+def group_all_gather_rows(x: torch.Tensor, group, size: int, ranks=None) -> torch.Tensor:
+    """All-gather ``[n, ...]`` along dim 0 over ``group`` -> ``[size * n, ...]``, the parts in GROUP-RANK
+    order (``ranks`` = the coordinator's member list; ``rank_in_group`` is the position in it).
+
+    On the NeuronCore (inside a compiled graph) the collective lowers to the registered replica groups,
+    which keep the list order, so the result is already in group-rank order. The Trn2 physical-mesh CP /
+    CFG groups can be descending (e.g. ``[12, 8]``) while the c10d group built from them is sorted, so a
+    gloo (CPU) gather comes back in sorted order; that branch re-orders the parts to the list."""
+    x = x.contiguous()
+    out = x.new_empty((size * x.shape[0], *x.shape[1:]))
+    dist.all_gather_into_tensor(out, x, group=group)
+    if ranks is not None and x.device.type == "cpu" and list(ranks) != sorted(ranks):
+        c10d = sorted(ranks)
+        pos = [c10d.index(r) for r in ranks]
+        out = out.view(size, *x.shape)[pos].reshape(out.shape)
+    return out
+
+
+def cp_all_gather_seq(x: torch.Tensor, group, size: int, ranks=None) -> torch.Tensor:
+    """All-gather ``[1, S_local, ...]`` along the sequence over the CP device group, in CP (group) rank
+    order (:func:`group_all_gather_rows`). Used for the per-layer GEN K/V (bidirectional attention with
+    per-token RoPE: their order only has to agree between K and V) and for the ``proj_out`` tokens of
+    :meth:`NeuronCosmos3EdgeGEN.forward_cp`, where it matters: token ``i`` of group rank ``r``'s slice is
+    global token ``r * S_local + i``."""
+    s = x.shape[1]
+    out = group_all_gather_rows(x.reshape(s, -1), group, size, ranks)
+    return out.view(1, size * s, *x.shape[2:])
+
+
 class EdgeGenLayer(nn.Module):
     def __init__(self, cfg: EdgeGenConfig, tp_size: int, dtype: torch.dtype):
         super().__init__()
@@ -77,16 +116,18 @@ class EdgeGenLayer(nn.Module):
         self.cfg = cfg
         self.tp_size = tp_size
         self.n_heads = cfg.num_heads // tp_size
-        self.n_kv = cfg.num_kv_heads // tp_size
+        self.n_kv = cfg.kv_heads_local(tp_size)
         self.q_weight = _sharded((cfg.num_heads * d, h), 0, tp_size, dtype)
-        self.k_weight = _sharded((cfg.num_kv_heads * d, h), 0, tp_size, dtype)
-        self.v_weight = _sharded((cfg.num_kv_heads * d, h), 0, tp_size, dtype)
+        self.k_weight = _param((self.n_kv * d, h), dtype)
+        self.v_weight = _param((self.n_kv * d, h), dtype)
         self.o_weight = _sharded((h, cfg.num_heads * d), 1, tp_size, dtype)
         self.q_norm_weight = nn.Parameter(torch.ones(d, dtype=dtype), requires_grad=False)
         self.k_norm_weight = nn.Parameter(torch.ones(d, dtype=dtype), requires_grad=False)
         self.input_norm_weight = nn.Parameter(torch.ones(h, dtype=dtype), requires_grad=False)
         self.post_norm_weight = nn.Parameter(torch.ones(h, dtype=dtype), requires_grad=False)
         self.up_weight = _sharded((cfg.intermediate_size, h), 0, tp_size, dtype)
+        if cfg.gated_mlp:
+            self.gate_weight = _sharded((cfg.intermediate_size, h), 0, tp_size, dtype)
         self.down_weight = _sharded((h, cfg.intermediate_size), 1, tp_size, dtype)
 
     def _all_reduce(self, x, group):
@@ -94,7 +135,7 @@ class EdgeGenLayer(nn.Module):
             dist.all_reduce(x, group=group)
         return x
 
-    def forward(self, x, k_und, v_und, cos, sin, key_bias, group):
+    def forward(self, x, k_und, v_und, cos, sin, key_bias, group, cp=None):
         cfg, d = self.cfg, self.cfg.head_dim
         b, s, _ = x.shape
         hn = rms_norm(x, self.input_norm_weight, cfg.rms_norm_eps)
@@ -105,13 +146,18 @@ class EdgeGenLayer(nn.Module):
             q = F.rms_norm(q, (d,), self.q_norm_weight, eps=cfg.rms_norm_eps)
             k = F.rms_norm(k, (d,), self.k_norm_weight, eps=cfg.rms_norm_eps)
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+        if (
+            cp is not None
+        ):  # context parallel: local queries attend to every rank's (RoPE'd) GEN K/V
+            k, v = cp_all_gather_seq(k, *cp), cp_all_gather_seq(v, *cp)
         k_all = torch.cat([k_und, k], dim=1).transpose(1, 2)
         v_all = torch.cat([v_und, v], dim=1).transpose(1, 2)
-        attn = edge_attention(q.transpose(1, 2), k_all, v_all, d**-0.5, key_bias=key_bias).transpose(1, 2)
+        attn = edge_attention(
+            q.transpose(1, 2), k_all, v_all, d**-0.5, key_bias=key_bias
+        ).transpose(1, 2)
         x = x + self._all_reduce(F.linear(attn.reshape(b, s, -1), self.o_weight), group)
         hn = rms_norm(x, self.post_norm_weight, cfg.rms_norm_eps)
-        mlp = F.relu(F.linear(hn, self.up_weight))
-        return x + self._all_reduce(F.linear(mlp * mlp, self.down_weight), group)
+        return x + self._all_reduce(mlp_forward(self, hn), group)
 
 
 class NeuronCosmos3EdgeGEN(nn.Module):
@@ -132,9 +178,15 @@ class NeuronCosmos3EdgeGEN(nn.Module):
         self.cfg = cfg
         self.dtype = dtype
         self.tp_size, self.tp_rank, self.tp_group = _tp_state()
+        self.cp_size, self.cp_rank, self.cp_group, self.cp_ranks = 1, 0, None, None
         h = cfg.hidden_size
-        self.layers = nn.ModuleList(EdgeGenLayer(cfg, self.tp_size, dtype) for _ in range(cfg.num_layers))
-        p = lambda *shape, dt=dtype: nn.Parameter(torch.empty(*shape, dtype=dt), requires_grad=False)  # noqa: E731
+        self.layers = nn.ModuleList(
+            EdgeGenLayer(cfg, self.tp_size, dtype) for _ in range(cfg.num_layers)
+        )
+
+        def p(*shape, dt=dtype):
+            return nn.Parameter(torch.empty(*shape, dtype=dt), requires_grad=False)
+
         self.proj_in_weight, self.proj_in_bias = p(h, cfg.patch_dim), p(h)
         self.proj_out_weight, self.proj_out_bias = p(cfg.patch_dim, h), p(cfg.patch_dim)
         # timestep embedder in fp32 (upstream post_load_weights casts it)
@@ -149,20 +201,15 @@ class NeuronCosmos3EdgeGEN(nn.Module):
         object.__setattr__(
             self,
             "_rotary_host",
-            Qwen3VLTextRotaryEmbedding(head_dim=cfg.head_dim, rope_theta=cfg.rope_theta, mrope_section=cfg.mrope_section),
+            Qwen3VLTextRotaryEmbedding(
+                head_dim=cfg.head_dim, rope_theta=cfg.rope_theta, mrope_section=cfg.mrope_section
+            ),
         )
         self._attach_weight_loaders()
 
     # -- weights --------------------------------------------------------------------------
     def _attach_weight_loaders(self) -> None:
-        if self.tp_size == 1:
-            return
-        from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
-
-        for layer in self.layers:
-            for name, dim in (("q_weight", 0), ("k_weight", 0), ("v_weight", 0), ("o_weight", 1), ("up_weight", 0), ("down_weight", 1)):
-                prm = getattr(layer, name)
-                set_weight_loader(prm, sharding_weight_loader(shard_dim=dim, shard_size=prm.shape[dim], num_shards=self.tp_size))
+        attach_tp_loaders(self.layers, self.tp_size, self.cfg)
 
     def checkpoint_mappings(self) -> dict[str, str]:
         m = {
@@ -194,6 +241,8 @@ class NeuronCosmos3EdgeGEN(nn.Module):
                     f"{p}.down_weight": f"{c}.mlp_moe_gen.down_proj.weight",
                 }
             )
+            if self.cfg.gated_mlp:
+                m[f"{p}.gate_weight"] = f"{c}.mlp_moe_gen.gate_proj.weight"
         return m
 
     def load_weights(self, model_path: str, device: torch.device | str = "cpu") -> None:
@@ -206,8 +255,12 @@ class NeuronCosmos3EdgeGEN(nn.Module):
         )
         self.load_state_dict(result.state_dict, strict=False, assign=True)
         if self.cfg.action_gen:  # DomainAwareLinear tables stay on the host (see _domain_weights)
-            want = {"action_proj_in.fc.weight": "w_in", "action_proj_in.bias.weight": "b_in",
-                    "action_proj_out.fc.weight": "w_out", "action_proj_out.bias.weight": "b_out"}
+            want = {
+                "action_proj_in.fc.weight": "w_in",
+                "action_proj_in.bias.weight": "b_in",
+                "action_proj_out.fc.weight": "w_out",
+                "action_proj_out.bias.weight": "b_out",
+            }
             for fn in sorted(f for f in os.listdir(tdir) if f.endswith(".safetensors")):
                 with safe_open(os.path.join(tdir, fn), "pt") as f:
                     for key in f.keys():
@@ -216,7 +269,9 @@ class NeuronCosmos3EdgeGEN(nn.Module):
         self.t_freqs = self.t_freqs.to(device)
 
     # -- host helpers ---------------------------------------------------------------------
-    def rope_tables(self, text_mask, t, h, w, fps=None, t_action=0, action_start_frame_offset=1, action_fps=None):
+    def rope_tables(
+        self, text_mask, t, h, w, fps=None, t_action=0, action_start_frame_offset=1, action_fps=None
+    ):
         """GEN cos/sin ``[B, S_gen, 1, D]`` via upstream's own ``_compute_rope_freqs``."""
         cfg = self.cfg
         p = cfg.patch
@@ -231,8 +286,17 @@ class NeuronCosmos3EdgeGEN(nn.Module):
             language_model=SimpleNamespace(rotary_emb=self._rotary_host),
         )
         _, (cos, sin) = Cosmos3VFMTransformer._compute_rope_freqs(
-            shim, text_mask, t, hp, wp, fps, torch.device("cpu"), self.dtype,
-            t_action=t_action, action_start_frame_offset=action_start_frame_offset, action_fps=action_fps,
+            shim,
+            text_mask,
+            t,
+            hp,
+            wp,
+            fps,
+            torch.device("cpu"),
+            self.dtype,
+            t_action=t_action,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
         )
         return cos.contiguous(), sin.contiguous()
 
@@ -276,30 +340,74 @@ class NeuronCosmos3EdgeGEN(nn.Module):
     def _time_embed(self, timestep, dtype):
         args = (timestep.float() * self.cfg.timestep_scale)[:, None] * self.t_freqs[None]
         tf = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        e = F.linear(F.silu(F.linear(tf, self.t_lin1_weight, self.t_lin1_bias)), self.t_lin2_weight, self.t_lin2_bias)
+        e = F.linear(
+            F.silu(F.linear(tf, self.t_lin1_weight, self.t_lin1_bias)),
+            self.t_lin2_weight,
+            self.t_lin2_bias,
+        )
         return e.to(dtype)
 
-    def _layers(self, hidden, cos, sin, key_bias, und_kv):
+    def _layers(self, hidden, cos, sin, key_bias, und_kv, cp=None):
         n = len(und_kv) // 2
         for layer, k_und, v_und in zip(self.layers, und_kv[:n], und_kv[n:], strict=True):
-            hidden = layer(hidden, k_und, v_und, cos, sin, key_bias, self.tp_group)
+            hidden = layer(hidden, k_und, v_und, cos, sin, key_bias, self.tp_group, cp)
         return rms_norm(hidden, self.norm_out_weight, self.cfg.rms_norm_eps)
+
+    def set_context_parallel(self, size: int, rank: int, group, ranks=None) -> None:
+        """CP over the GEN video tokens (``ring_degree`` in the stage config): each CP rank runs
+        :meth:`forward_cp` on its contiguous ``1/size`` slice of the patchified sequence and
+        all-gathers the per-layer K/V and the output tokens over ``group`` (the CP device group).
+        ``rank`` is the group rank, i.e. the position in ``ranks`` (the coordinator's member list,
+        which may be descending on the Trn2 physical mesh). Weights stay TP-sharded."""
+        self.cp_size, self.cp_rank, self.cp_group, self.cp_ranks = size, rank, group, ranks
+
+    def forward_cp(self, tokens, timestep, cos, sin, key_bias, noisy_mask, *und_kv):
+        """Context-parallel video GEN call on this rank's patchified token slice
+        ``[1, S_video / cp, patch_dim]`` (``cos`` / ``sin`` / ``noisy_mask`` sliced the same way).
+        Returns the FULL ``proj_out`` token sequence ``[1, S_video, patch_dim]``, identical on every CP
+        rank: the local tokens are all-gathered over the CP device group inside this graph, in CP
+        group-rank order. The caller unpatchifies."""
+        cp = (self.cp_group, self.cp_size, self.cp_ranks)
+        hidden = F.linear(tokens.to(self.dtype), self.proj_in_weight, self.proj_in_bias)
+        hidden = hidden + self._time_embed(timestep, hidden.dtype).unsqueeze(1) * noisy_mask
+        hidden = self._layers(hidden, cos, sin, key_bias, und_kv, cp=cp)
+        return cp_all_gather_seq(F.linear(hidden, self.proj_out_weight, self.proj_out_bias), *cp)
 
     def forward(self, latents, timestep, cos, sin, key_bias, noisy_mask, *und_kv):
         _, _, t, h, w = latents.shape
-        hidden = F.linear(self._patchify(latents.to(self.dtype)), self.proj_in_weight, self.proj_in_bias)
+        hidden = F.linear(
+            self._patchify(latents.to(self.dtype)), self.proj_in_weight, self.proj_in_bias
+        )
         hidden = hidden + self._time_embed(timestep, hidden.dtype).unsqueeze(1) * noisy_mask
         hidden = self._layers(hidden, cos, sin, key_bias, und_kv)
         return self._unpatchify(F.linear(hidden, self.proj_out_weight, self.proj_out_bias), t, h, w)
 
-    def forward_action(self, latents, timestep, cos, sin, key_bias, noisy_mask, action, action_noisy_mask,
-                       w_in, b_in, w_out, b_out, *und_kv):
+    def forward_action(
+        self,
+        latents,
+        timestep,
+        cos,
+        sin,
+        key_bias,
+        noisy_mask,
+        action,
+        action_noisy_mask,
+        w_in,
+        b_in,
+        w_out,
+        b_out,
+        *und_kv,
+    ):
         _, _, t, h, w = latents.shape
-        hv = F.linear(self._patchify(latents.to(self.dtype)), self.proj_in_weight, self.proj_in_bias)
+        hv = F.linear(
+            self._patchify(latents.to(self.dtype)), self.proj_in_weight, self.proj_in_bias
+        )
         s_video = hv.shape[1]
         ha = torch.matmul(action.to(self.dtype), w_in) + b_in + self.action_modality_embed
         temb = self._time_embed(timestep, hv.dtype).unsqueeze(1)
         hidden = torch.cat([hv + temb * noisy_mask, ha + temb * action_noisy_mask], dim=1)
         hidden = self._layers(hidden, cos, sin, key_bias, und_kv)
-        video = self._unpatchify(F.linear(hidden[:, :s_video], self.proj_out_weight, self.proj_out_bias), t, h, w)
+        video = self._unpatchify(
+            F.linear(hidden[:, :s_video], self.proj_out_weight, self.proj_out_bias), t, h, w
+        )
         return video, torch.matmul(hidden[:, s_video:], w_out) + b_out

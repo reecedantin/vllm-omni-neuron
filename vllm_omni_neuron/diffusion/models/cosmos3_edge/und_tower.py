@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cosmos3-Edge UND (reasoner) tower for Neuron.
+"""Cosmos3 UND (reasoner) tower for Neuron: Cosmos3-Edge, Cosmos3-Nano and Cosmos3-Super.
 
 The Edge transformer is a Mixture-of-Transformers: every one of its 28 layers has an UND
 (text) half and a GEN (diffusion) half. The UND half is a Nemotron dense decoder layer
@@ -7,6 +7,11 @@ The Edge transformer is a Mixture-of-Transformers: every one of its 28 layers ha
 ``[24, 20, 20]`` / theta 1e8). It runs once per request and CFG branch, and its only output
 is, per layer, the GEN-facing key (``k_norm_und_for_gen`` RMSNorm, then RoPE) and the raw
 value. The GEN tower cross-attends to those.
+
+Cosmos3-Nano / Cosmos3-Super (no ``backbone_type`` in the config) use upstream's
+``Cosmos3LanguageModel`` instead: a Qwen3-VL text decoder (per-head QK RMSNorm before RoPE,
+SiLU-gated MLP, mRoPE theta 5e6), and the GEN-facing key is the same normed, rotated key the
+UND attention uses. :class:`EdgeTextConfig` reads which backbone a checkpoint has.
 
 This module re-implements upstream's ``Cosmos3EdgeLanguageModel`` (vendored in
 ``_vendor/transformer_cosmos3_edge.py``) in the plugin's style: raw ``nn.Parameter`` weights
@@ -65,10 +70,26 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return xf.to(x.dtype) * weight
 
 
+COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+
+
 class EdgeTextConfig:
-    """The UND-tower subset of ``transformer/config.json``."""
+    """The UND-tower subset of ``transformer/config.json``.
+
+    ``backbone`` is ``"nemotron"`` (Cosmos3-Edge: ReLU^2 MLP, no UND QK-norm, separate
+    ``k_norm_und_for_gen``) or ``"qwen3"`` (Cosmos3-Nano / Super: SiLU-gated MLP, UND QK-norm).
+    """
 
     def __init__(self, cfg: dict):
+        backbone_type = cfg.get("backbone_type")
+        if backbone_type is None:
+            self.backbone = "qwen3"
+        elif backbone_type == COSMOS3_EDGE_BACKBONE_TYPE:
+            self.backbone = "nemotron"
+        else:
+            raise ValueError(f"unsupported Cosmos3 backbone_type={backbone_type!r}")
+        self.gated_mlp = self.backbone == "qwen3"
+        self.und_qk_norm = self.backbone == "qwen3" and bool(cfg.get("qk_norm_for_text", True))
         self.hidden_size = int(cfg.get("hidden_size", 2048))
         self.intermediate_size = int(cfg.get("intermediate_size", 9216))
         self.num_layers = int(cfg.get("num_hidden_layers", 28))
@@ -80,7 +101,21 @@ class EdgeTextConfig:
         self.rope_theta = float(cfg.get("rope_theta", 1e8))
         rs = cfg.get("rope_scaling") or {}
         self.mrope_section = list(rs.get("mrope_section", cfg.get("rope_axes_dim", [24, 20, 20])))
-        self.use_und_k_norm_for_gen = bool(cfg.get("use_und_k_norm_for_gen", True))
+        self.use_und_k_norm_for_gen = self.backbone == "nemotron" and bool(
+            cfg.get("use_und_k_norm_for_gen", True)
+        )
+        self.sound_gen = bool(cfg.get("sound_gen", False))
+
+    def kv_heads_local(self, tp: int) -> int:
+        """K/V heads per rank. When TP exceeds the K/V head count (Super at TP=16) every rank
+        holds ONE full K/V head, shared by ``tp // num_kv_heads`` neighbouring ranks."""
+        if tp <= self.num_kv_heads:
+            if self.num_kv_heads % tp:
+                raise ValueError(f"tp_size={tp} must divide num_kv_heads={self.num_kv_heads}")
+            return self.num_kv_heads // tp
+        if tp % self.num_kv_heads:
+            raise ValueError(f"tp_size={tp} must be a multiple of num_kv_heads={self.num_kv_heads}")
+        return 1
 
     @classmethod
     def from_model_dir(cls, model_path: str) -> EdgeTextConfig:
@@ -94,6 +129,69 @@ def _sharded(shape, shard_dim, tp, dtype):
     return nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
 
 
+def _param(shape, dtype):
+    return nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+
+
+def attach_tp_loaders(layers, tp_size: int, cfg: EdgeTextConfig) -> None:
+    """Sharding loaders for one tower's layers (Q/K/V/up/gate column-, O/down row-parallel).
+
+    K/V: plain row shards while ``tp <= num_kv_heads``; above that, rank ``r`` loads the whole
+    head ``r * num_kv_heads // tp`` (KV-head replication), which is the head its local query
+    heads belong to under GQA.
+    """
+    if tp_size == 1:
+        return
+    from vllm_neuron.utils.weight_loader import (
+        SafetensorsWeightLoader,
+        set_weight_loader,
+        sharding_weight_loader,
+    )
+
+    d, nkv = cfg.head_dim, cfg.num_kv_heads
+    replicate = tp_size > nkv
+
+    def kv_rows(slices, rank):
+        head = rank * nkv // tp_size
+        return slices[0][head * d : (head + 1) * d, :]
+
+    for layer in layers:
+        for name, dim in (
+            ("q_weight", 0),
+            ("k_weight", 0),
+            ("v_weight", 0),
+            ("o_weight", 1),
+            ("up_weight", 0),
+            ("gate_weight", 0),
+            ("down_weight", 1),
+        ):
+            prm = getattr(layer, name, None)
+            if prm is None:
+                continue
+            if replicate and name in ("k_weight", "v_weight"):
+                set_weight_loader(prm, SafetensorsWeightLoader(transform=kv_rows))
+            else:
+                set_weight_loader(
+                    prm,
+                    sharding_weight_loader(
+                        shard_dim=dim, shard_size=prm.shape[dim], num_shards=tp_size
+                    ),
+                )
+
+
+def mlp_forward(layer, hn: torch.Tensor) -> torch.Tensor:
+    """MLP of one layer up to (excluding) the row-parallel all-reduce.
+
+    SiLU-gated (Qwen3: Nano / Super) or ReLU^2 (Nemotron: Edge)."""
+    if layer.cfg.gated_mlp:
+        return F.linear(
+            F.silu(F.linear(hn, layer.gate_weight)) * F.linear(hn, layer.up_weight),
+            layer.down_weight,
+        )
+    mlp = F.relu(F.linear(hn, layer.up_weight))
+    return F.linear(mlp * mlp, layer.down_weight)
+
+
 class EdgeUndLayer(nn.Module):
     def __init__(self, cfg: EdgeTextConfig, tp_size: int, dtype: torch.dtype):
         super().__init__()
@@ -101,15 +199,21 @@ class EdgeUndLayer(nn.Module):
         self.cfg = cfg
         self.tp_size = tp_size
         self.n_heads = cfg.num_heads // tp_size
-        self.n_kv = cfg.num_kv_heads // tp_size
+        self.n_kv = cfg.kv_heads_local(tp_size)
         self.q_weight = _sharded((cfg.num_heads * d, h), 0, tp_size, dtype)
-        self.k_weight = _sharded((cfg.num_kv_heads * d, h), 0, tp_size, dtype)
-        self.v_weight = _sharded((cfg.num_kv_heads * d, h), 0, tp_size, dtype)
+        self.k_weight = _param((self.n_kv * d, h), dtype)
+        self.v_weight = _param((self.n_kv * d, h), dtype)
         self.o_weight = _sharded((h, cfg.num_heads * d), 1, tp_size, dtype)
-        self.k_norm_gen_weight = nn.Parameter(torch.ones(d, dtype=dtype), requires_grad=False)
+        if cfg.use_und_k_norm_for_gen:
+            self.k_norm_gen_weight = nn.Parameter(torch.ones(d, dtype=dtype), requires_grad=False)
+        if cfg.und_qk_norm:
+            self.q_norm_weight = nn.Parameter(torch.ones(d, dtype=dtype), requires_grad=False)
+            self.k_norm_weight = nn.Parameter(torch.ones(d, dtype=dtype), requires_grad=False)
         self.input_norm_weight = nn.Parameter(torch.ones(h, dtype=dtype), requires_grad=False)
         self.post_norm_weight = nn.Parameter(torch.ones(h, dtype=dtype), requires_grad=False)
         self.up_weight = _sharded((cfg.intermediate_size, h), 0, tp_size, dtype)
+        if cfg.gated_mlp:
+            self.gate_weight = _sharded((cfg.intermediate_size, h), 0, tp_size, dtype)
         self.down_weight = _sharded((h, cfg.intermediate_size), 1, tp_size, dtype)
 
     def _all_reduce(self, x, group):
@@ -124,6 +228,9 @@ class EdgeUndLayer(nn.Module):
         q = F.linear(hn, self.q_weight).view(b, s, self.n_heads, d)
         k = F.linear(hn, self.k_weight).view(b, s, self.n_kv, d)
         v = F.linear(hn, self.v_weight).view(b, s, self.n_kv, d)
+        if cfg.und_qk_norm:
+            q = F.rms_norm(q, (d,), self.q_norm_weight, eps=cfg.rms_norm_eps)
+            k = F.rms_norm(k, (d,), self.k_norm_weight, eps=cfg.rms_norm_eps)
         q_r, k_r = _apply_rotary_pos_emb(q, k, cos, sin)
         if cfg.use_und_k_norm_for_gen:
             k_gen = F.rms_norm(k, (d,), self.k_norm_gen_weight, eps=cfg.rms_norm_eps)
@@ -141,8 +248,7 @@ class EdgeUndLayer(nn.Module):
         ).transpose(1, 2)
         x = x + self._all_reduce(F.linear(attn.reshape(b, s, -1), self.o_weight), group)
         hn = rms_norm(x, self.post_norm_weight, cfg.rms_norm_eps)
-        mlp = F.relu(F.linear(hn, self.up_weight))
-        x = x + self._all_reduce(F.linear(mlp * mlp, self.down_weight), group)
+        x = x + self._all_reduce(mlp_forward(self, hn), group)
         return x, k_gen, v
 
 
@@ -160,12 +266,13 @@ class NeuronCosmos3EdgeUND(nn.Module):
         self.cfg = cfg
         self.dtype = dtype
         self.tp_size, self.tp_rank, self.tp_group = _tp_state()
-        if cfg.num_kv_heads % self.tp_size:
-            raise ValueError(f"tp_size={self.tp_size} must divide num_kv_heads={cfg.num_kv_heads}")
+        cfg.kv_heads_local(self.tp_size)  # validates the TP degree
         self.embed_weight = nn.Parameter(
             torch.empty(cfg.vocab_size, cfg.hidden_size, dtype=dtype), requires_grad=False
         )
-        self.layers = nn.ModuleList(EdgeUndLayer(cfg, self.tp_size, dtype) for _ in range(cfg.num_layers))
+        self.layers = nn.ModuleList(
+            EdgeUndLayer(cfg, self.tp_size, dtype) for _ in range(cfg.num_layers)
+        )
         # host-side rotary (pure math, never moved to the device)
         # (bypasses nn.Module registration so .to(device) leaves it on the host)
         object.__setattr__(
@@ -179,21 +286,7 @@ class NeuronCosmos3EdgeUND(nn.Module):
 
     # -- weights --------------------------------------------------------------------------
     def _attach_weight_loaders(self) -> None:
-        if self.tp_size == 1:
-            return
-        from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
-
-        for layer in self.layers:
-            for name, dim in (
-                ("q_weight", 0),
-                ("k_weight", 0),
-                ("v_weight", 0),
-                ("o_weight", 1),
-                ("up_weight", 0),
-                ("down_weight", 1),
-            ):
-                p = getattr(layer, name)
-                set_weight_loader(p, sharding_weight_loader(shard_dim=dim, shard_size=p.shape[dim], num_shards=self.tp_size))
+        attach_tp_loaders(self.layers, self.tp_size, self.cfg)
 
     def checkpoint_mappings(self) -> dict[str, str]:
         m = {"embed_weight": "embed_tokens.weight"}
@@ -205,13 +298,19 @@ class NeuronCosmos3EdgeUND(nn.Module):
                     f"{p}.k_weight": f"{c}.self_attn.to_k.weight",
                     f"{p}.v_weight": f"{c}.self_attn.to_v.weight",
                     f"{p}.o_weight": f"{c}.self_attn.to_out.weight",
-                    f"{p}.k_norm_gen_weight": f"{c}.self_attn.k_norm_und_for_gen.weight",
                     f"{p}.input_norm_weight": f"{c}.input_layernorm.weight",
                     f"{p}.post_norm_weight": f"{c}.post_attention_layernorm.weight",
                     f"{p}.up_weight": f"{c}.mlp.up_proj.weight",
                     f"{p}.down_weight": f"{c}.mlp.down_proj.weight",
                 }
             )
+            if self.cfg.use_und_k_norm_for_gen:
+                m[f"{p}.k_norm_gen_weight"] = f"{c}.self_attn.k_norm_und_for_gen.weight"
+            if self.cfg.und_qk_norm:
+                m[f"{p}.q_norm_weight"] = f"{c}.self_attn.norm_q.weight"
+                m[f"{p}.k_norm_weight"] = f"{c}.self_attn.norm_k.weight"
+            if self.cfg.gated_mlp:
+                m[f"{p}.gate_weight"] = f"{c}.mlp.gate_proj.weight"
         return m
 
     def load_weights(self, model_path: str, device: torch.device | str = "cpu") -> None:

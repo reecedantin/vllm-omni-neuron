@@ -1,0 +1,26 @@
+# Cosmos3-Nano-Policy-DROID / Cosmos3-Edge-Policy-DROID on Trn2: two chips (8 logical cores at LNC=2),
+# TP=4 x CFG-parallel 2.
+# Robot action modes (policy / forward_dynamics / inverse_dynamics) with guidance > 1 (DROID recipe:
+# guidance 3.0, 4 steps): the conditional and unconditional passes run on separate TP=4 groups, VAE
+# decode patch-parallel over all 8 ranks. At 832x480 also export COSMOS3_EDGE_VAE_TILE=256,256,240,208
+# (2 x 4 latent tiles, no thin edge tile).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Cosmos3OmniPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        compile_vae_encoder: true
+        guardrails: false
+      parallel_config:
+        tensor_parallel_size: 4
+        cfg_parallel_size: 2
+        vae_patch_parallel_size: 8
