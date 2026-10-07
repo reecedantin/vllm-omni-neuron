@@ -1,0 +1,33 @@
+# InternVLA-A1.5 policy on AWS Trainium2 (trn2) via vLLM Omni Neuron. One NeuronCore, TP=1: the
+# model is ~5.4 GB in bf16 (2.68B params), well under one trn2 logical core's ~24 GB (LNC=2).
+# Three graphs (vision, VLM prefix, flow-matching action-expert denoise step) compile on first
+# use; later runs hit the NEFF cache. Multi-rank (M3) uses fleet/bin/multirank.sh and a comma-list
+# `devices:` instead of this single-core form.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: actions
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: InternVLAA15Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # Qwen3.5-2B VLM config.json the checkpoint itself doesn't carry; leave unset to use
+        # $INTERNVLA_VLM_CONFIG, or <model>/vlm/config.json
+        # vlm_config: /path/to/qwen3.5-config/config.json
+        # Qwen3.5 tokenizer directory (tokenizer.json + tokenizer_config.json, e.g. Qwen/Qwen3.5-2B);
+        # leave unset to use $INTERNVLA_TOKENIZER. Requests are refused without one.
+        # tokenizer: /path/to/qwen3.5-tokenizer
+        #
+        # A bare `model_config:` with no key parses as YAML null, and the engine's own
+        # _setup_tensor_capture does `self.od_config.model_config.get(...)` unconditionally ->
+        # AttributeError on None. Keep at least one real key (a placeholder is fine) so
+        # model_config is always a dict.
+        _placeholder: true
+      parallel_config:
+        tensor_parallel_size: 1
