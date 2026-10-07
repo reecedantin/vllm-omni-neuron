@@ -201,12 +201,12 @@ peak_per_core ≈ W/TP           # weights — TP shards; CP and CFG replicate
   (~27 B params ≈ 54 GB in BF16; only one is *active* per step, but both sit in HBM).
   Only **TP** shards weights — CP and CFG each hold a full copy per replica. This is the
   largest fixed term and the reason TP cannot go too low on a memory-tight spec.
-- **Shardable activations `A_shard`.** Q, K/V, FFN intermediates, and hidden states shard
-  on **both TP and CP** (`1/(TP·CP)` per core). K/V shard because CP self-attention uses
-  {ref}`ring attention <context-parallelism>`, which keeps
-  each core's K/V local instead of gathering the full sequence — so `A_shard` is rarely the
-  binding term once CP ≥ 4. (The all-gather fallback, used only where the ring kernel cannot
-  run, would instead pin full-sequence K/V on every core.)
+- **Shardable activations `A_shard`.** Q, FFN intermediates, and hidden states shard
+  on **both TP and CP** (`1/(TP·CP)` per core). K/V shard on TP only: CP self-attention
+  {ref}`all-gathers K/V <context-parallelism>` across the CP group by default, so every core
+  holds full-sequence K/V for its heads during attention. (The opt-in ring-attention kernel,
+  `WAN22_CP_RING_ATTENTION=1`, keeps each core's K/V local instead, but its softmax bound can
+  zero attention rows at late denoising steps.)
 - **Workspace.** Compiler-managed kernel scratch; not a lever you tune directly.
 
 CFG is absent from the levers above on purpose: a CFG replica is a full copy of the model
@@ -246,23 +246,25 @@ the head count.
 
 CP shards the token sequence `S` across ranks. It is the only axis that reduces **both**
 per-rank compute *and* the activation-memory footprint, which is why it is the lever for
-long or high-resolution clips. Wan2.2 uses **ring-attention CP**: each rank keeps its local
-`S/CP` shard of Q *and* K/V, and the ring-attention kernel streams K/V chunks around the CP
-group (via `collective_permute`) so local Q still attends the full sequence — without any
-rank materializing full K/V. (Where the ring kernel cannot run — CPU mode, fake-tensor
-tracing, NKI disabled — it falls back to all-gathering full K/V + flash.)
+long or high-resolution clips. By default Wan2.2 CP keeps each rank's `S/CP` shard of Q and
+all-gathers K/V across the CP group, so local Q attends the full sequence with an exact (true
+row maximum, FP32) softmax. An opt-in ring-attention kernel (`WAN22_CP_RING_ATTENTION=1`) streams
+K/V chunks around the CP group via `collective_permute` instead, so no rank materializes full
+K/V; its static softmax bound can zero attention rows at late denoising steps, which is why it
+is not the default.
 
 - **Compute** per rank scales as `~1/CP`: each rank owns only `S/CP` query tokens, so both
   the projection/FFN matmuls and the attention itself shrink with CP. The attention saving
   matters most for long or high-resolution clips, where all-pairs attention over the
   sequence is the largest cost.
-- **Memory** shrinks by `1/CP` for **all** the shardable activations — Q, FFN, *and* K/V —
-  because ring attention never gathers the full K/V. This is what makes CP the axis that
-  buys HBM headroom for long or high-resolution clips.
-- **Communication** is the counter-pressure. Ring attention exchanges a `S/CP` K/V chunk per
-  round over `CP` rounds per layer; the rounds are overlapped with attention compute but
-  their count grows with CP, so past a point the ring latency dominates the savings. This is
-  the diminishing-returns knee — the reason to stop at **CP=8**, not push to 16 or 32.
+- **Memory** shrinks by `1/CP` for Q, FFN and hidden states. With the default all-gather,
+  full-sequence K/V is resident per rank during attention; only the opt-in ring kernel shrinks
+  K/V by `1/CP` too.
+- **Communication** is the counter-pressure. The all-gather moves `(CP-1)/CP` of the K/V per
+  layer in one collective; the ring kernel exchanges a `S/CP` K/V chunk per round over `CP`
+  rounds, overlapped with attention compute. Either way the cost grows with CP, so past a
+  point it dominates the savings. This is the diminishing-returns knee — the reason to stop at
+  **CP=8**, not push to 16 or 32.
 
 The current constraint is that `S` must be divisible by `ring_degree`:
 
@@ -302,7 +304,7 @@ The overhead `ε` is small by construction. The gather-combine
 ([`cfg_parallel.py`](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/vllm_omni_neuron/diffusion/distributed/cfg_parallel.py))
 all-gathers the predicted-noise **latent** — shape `[B, C, T_lat, H_lat, W_lat]`, ≈ 4.2 MB
 at 480P in BF16 — **once per step**, in its own fullgraph NEFF. Compare that to one DiT
-pass: 40 layers, each moving `S · hidden` activations and running the per-layer ring K/V
+pass: 40 layers, each moving `S · hidden` activations and running the per-layer K/V
 exchange. The gather is orders of magnitude cheaper and happens once per step, not once per layer, so
 `ε ≪ 0.1` and the expected DiT speedup is **≈ 1.8–2.0×**. To size `ε` for a new spec,
 divide the latent bytes by the per-step DiT traffic — both scale with the spec, but the
@@ -354,10 +356,10 @@ additional attention, output-projection, and MLP paths:
 
 | NKI kernel | Source | Where it runs | Role |
 | --- | --- | --- | --- |
-| [`ring_attention_const_max_fwd`](kernels/ring-attention-const-max.md) | Vendored | DiT self-attention with context parallelism | Rotates sharded K/V and overlaps the exchange with const-max attention. |
+| [`ring_attention_const_max_fwd`](kernels/ring-attention-const-max.md) | Vendored | DiT self-attention with context parallelism, opt-in (`WAN22_CP_RING_ATTENTION=1`) | Rotates sharded K/V and overlaps the exchange with const-max attention. |
 | [`adaln_quant_kernel`](kernels/adaln-quant.md) | Vendored | DiT normalization | Fuses residual addition, modulation, and optional row FP8 quantization. |
 | [`qkv_cte`](kernels/qkv-cte.md) | Vendored | DiT FP8 self- and cross-attention projections | Fuses QKV projection, distributed QK RMSNorm, and RoPE. |
-| `attention_cte` | Installed `nkilib.core.attention` | DiT local attention and VAE decoder attention | Flash attention when the ring path does not apply. |
+| `attention_cte` | Installed `nkilib.core.attention` | DiT self-attention (default CP path, after the K/V all-gather), DiT local attention and VAE decoder attention | Flash attention with the true row maximum. |
 | `output_projection_cte` | Installed `nkilib.core.output_projection` | DiT BF16 and FP8 attention output | Output projection. |
 | `mlp` | Installed `nkilib.core.mlp` | DiT BF16 feed-forward | Gate-less GELU up/down projections. |
 | `mlp` | Vendored `vllm_omni_neuron.kernels.nkilib.core.mlp` | DiT FP8 feed-forward | ROW_MX up/down projections. |
@@ -398,7 +400,8 @@ parallel_config:
 
 ```bash
 sudo docker exec vllm-omni-neuron python /workspace/plugin/examples/wan22/run.py \
-  --stage-config /workspace/plugin/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml \
+  --stage-config /workspace/plugin/examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml \
+  --tensor-parallel-size 8 \
   --num-frames 81 --height 720 --width 1280 --guidance-scale 5.0 \
   --prompt "A fluffy orange cat walking gracefully across a sunny garden path, high quality, detailed" \
   --output 720P.mp4

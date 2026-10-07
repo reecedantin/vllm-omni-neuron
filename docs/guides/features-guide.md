@@ -298,15 +298,19 @@ adjust the output shape or use a smaller `ring_degree`.
 
 #### Context-parallel attention
 
-Context-parallel self-attention uses ring attention: it rotates local K/V chunks
-around the CP group instead of materializing full K/V on every rank. Where the
-ring kernel cannot run (CPU mode, fake-tensor tracing, NKI kernels disabled) the
-runtime falls back to all-gather K/V with flash attention automatically.
+Context-parallel self-attention all-gathers K/V across the CP group and runs flash
+attention with each query row's true maximum and an FP32 softmax. This is the
+default for every Wan2.2 model.
 
-Because the ring kernel has no online-max pass, the softmax maximum is bounded up
-front, at one value per query row. The bound is static across ring steps, so merging
-each rank's partial attention is pure addition — no running max and no correction
-factors travel around the ring.
+A const-max ring-attention kernel, which rotates local K/V chunks around the CP
+group instead of materializing full K/V on every rank, is available as an opt-in
+(`WAN22_CP_RING_ATTENTION=1`). It has no online-max pass: it shifts every softmax
+row by a static Cauchy-Schwarz bound, so merging each rank's partial attention is
+pure addition. When that bound overshoots a row's true maximum by more than about
+85 (in exponent units), every probability of the row underflows and the kernel
+returns an all-zero attention row. In Wan2.2 this happens at the late, low-noise
+denoising steps, so the ring kernel is not the default; it also needs an evenly
+divisible sequence and NKI kernels (it never runs in CPU mode or fake-tensor tracing).
 
 ### CFG parallelism
 
