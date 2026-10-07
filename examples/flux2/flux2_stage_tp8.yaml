@@ -1,0 +1,32 @@
+# FLUX.2-dev text-to-image on Neuron (vLLM-Omni), TP=8 alternative: 8 logical NeuronCores (two Trn2 chips at
+# LNC=2), ~15 GiB HBM per core at 1024 px. Use it when 8 cores is the budget; flux2_stage.yaml (TP=8 x CP=4 on
+# 32 cores) is the recommended low-latency layout. The text encoder (Mistral layers 0-29) and the DiT are both
+# resident on the same cores. The VAE decodes on the NeuronCores as fixed-shape tiles (512 px tiles, 128 px
+# overlap) with whole-image GroupNorm statistics, dealt across the ranks.
+# Graphs compile per resolution on first use (the VAE tile graphs once for every resolution); later
+# runs hit the NEFF cache.
+#
+# `devices` are logical indices into NEURON_VISIBLE_DEVICES (a comma list, not a range).
+# VAE knobs are environment variables (see vllm_omni_neuron/diffusion/models/flux2/vae_flux2.py):
+# FLUX2_VAE_TILE (latent tile, 64), FLUX2_VAE_OVERLAP (latent overlap, 16), FLUX2_VAE_GN_PASSES (2).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Flux2Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # DiT blocks per compiled graph (must divide the 8 double / 48 single blocks; defaults 1 / 6)
+        double_group: 1
+        single_group: 6
+        # text-encoder layers per compiled graph (must divide 10, 20 and 30)
+        te_group: 10
+      parallel_config:
+        tensor_parallel_size: 8
