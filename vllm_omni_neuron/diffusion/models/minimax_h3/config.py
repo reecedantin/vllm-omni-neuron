@@ -113,6 +113,35 @@ def vsa_sparsity(model_path: str) -> float | None:
     return float(c["vsa_sparsity"])
 
 
+BASE_NUM_INFERENCE_STEPS = (
+    50  # base MiniMax-H3 request default: 50 denoiser evaluations (vLLM-Omni v0.30.0)
+)
+BASE_TASKS = (
+    "t2va",
+)  # base tasks ported so far; FL2VA / Ref2VA (transformer_ref) are not supported yet
+
+
+def is_base_checkpoint(model_path: str) -> bool:
+    """True for the base MiniMax-H3 release (50-step, guidance-distilled), False for a FastH3 student. FastH3
+    exports carry FastVideo's ``fastvideo_inference.json`` sampling contract; the base release has none."""
+    return not os.path.isfile(os.path.join(model_path, "fastvideo_inference.json"))
+
+
+def base_sigmas(num_inference_steps: int, shift: float) -> list[float]:
+    """The base request's sigma boundaries, as vLLM-Omni v0.30.0 builds them (``minimax_h3_time_shift_sigmas``):
+    ``num_inference_steps`` counts denoiser evaluations, so the grid is ``linspace(1, 0, N + 1)`` (both endpoints),
+    pushed through the exponential shift ``s * x / (1 + (s - 1) * x)`` in fp32. N + 1 values, N forwards."""
+    import torch
+
+    if num_inference_steps < 1:
+        raise ValueError(f"num_inference_steps must be >= 1, got {num_inference_steps}")
+    if shift <= 0:
+        raise ValueError(f"shift must be > 0, got {shift}")
+    base = torch.linspace(1.0, 0.0, int(num_inference_steps) + 1, dtype=torch.float32)
+    shifted = float(shift) * base / (1 + (float(shift) - 1) * base)
+    return [float(v) for v in shifted.tolist()]
+
+
 def step_positions(model_path: str, num_inference_steps: int) -> tuple[float, ...] | None:
     """The trained rung ladder as pre-shift positions in [0, 1] closed with 0.0, when the checkpoint declares one
     and the request asks for exactly that many grid points; else None (the scheduler's own linspace grid)."""

@@ -1,0 +1,29 @@
+# Base MiniMax-H3 (50-step t2va) on Neuron (vLLM-Omni): TP=8 x CP=8 over 64 logical NeuronCores (the whole
+# trn2.48xlarge: 16 chips at LNC=2). Point the model at the checkpoint root (the Diffusers layout with transformer/,
+# vae/, audio_vae/, text_encoder/); only transformer/ is loaded for t2va (transformer_ref/ is the Ref2VA DiT).
+# Same parallel layout as the FastH3 recommendation (minimax_h3_stage.yaml): each CP rank holds 1/8 of the packed
+# sequence, the TP / CP groups sit on the physical mesh, the video VAE deals its tiles over all 64 ranks, the audio
+# VAE windows run on the last 8 ranks and the Qwen3-VL text encoder runs TP=8 on every CP replica.
+# Requests follow vLLM-Omni v0.30.0's base contract: num_inference_steps = denoiser evaluations (default 50), shifts
+# 12 / 3 (extra_args flow_shift / audio_flow_shift), one conditional forward per step (guidance-distilled).
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: video
+    runtime:
+      process: true
+      # logical indices into the visible cores, a comma list (never a range)
+      devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: MiniMaxH3ModularPipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        adaln: device
+        text_encoder: device
+        num_inference_steps: 50
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 8

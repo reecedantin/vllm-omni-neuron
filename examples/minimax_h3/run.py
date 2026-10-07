@@ -55,7 +55,20 @@ parser.add_argument("--height", type=int, default=384)
 parser.add_argument("--width", type=int, default=640)
 parser.add_argument("--num-frames", type=int, default=124)
 parser.add_argument(
-    "--steps", type=int, default=None, help="sigma grid points (FastH3: 5 = 4 forwards)"
+    "--steps",
+    type=int,
+    default=None,
+    help="num_inference_steps (FastH3: sigma grid points, 5 = 4 forwards; base MiniMax-H3: denoiser "
+    "evaluations, default 50)",
+)
+parser.add_argument(
+    "--flow-shift", type=float, default=None, help="base MiniMax-H3: video sigma shift (default 12)"
+)
+parser.add_argument(
+    "--audio-flow-shift",
+    type=float,
+    default=None,
+    help="base MiniMax-H3: audio sigma shift (default 3)",
 )
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", default="minimax_h3.mp4")
@@ -224,8 +237,15 @@ def main() -> None:
     )
     if args.steps:
         kw["num_inference_steps"] = args.steps
+    extra = {}
     if args.prompt_embeds:
-        kw["extra_args"] = {"prompt_embeds_file": os.path.abspath(args.prompt_embeds)}
+        extra["prompt_embeds_file"] = os.path.abspath(args.prompt_embeds)
+    if args.flow_shift is not None:
+        extra["flow_shift"] = args.flow_shift
+    if args.audio_flow_shift is not None:
+        extra["audio_flow_shift"] = args.audio_flow_shift
+    if extra:
+        kw["extra_args"] = extra
     params = OmniDiffusionSamplingParams(**kw)
     prompt = {"prompt": args.prompt}
     t0 = time.perf_counter()

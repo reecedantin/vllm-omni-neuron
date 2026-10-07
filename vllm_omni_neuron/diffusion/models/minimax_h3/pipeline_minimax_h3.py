@@ -28,8 +28,12 @@ import torch.nn as nn
 
 from . import config as C
 from .config import (
+    BASE_NUM_INFERENCE_STEPS,
+    BASE_TASKS,
     MiniMaxH3DiTConfig,
+    base_sigmas,
     inference_contract,
+    is_base_checkpoint,
     read_model_index,
     step_positions,
     text_encoder_layer,
@@ -140,6 +144,15 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
             else None
         )
         self.default_steps = int(mc.get("num_inference_steps") or _default_steps(self.model_path))
+        # Base MiniMax-H3 (no FastVideo contract): the request contract of vLLM-Omni v0.30.0's MiniMax-H3 pipeline.
+        # num_inference_steps counts denoiser evaluations (default 50, sigma boundaries linspace(1, 0, N + 1)
+        # shifted by flow_shift / audio_flow_shift, default the checkpoint's 12 / 3), one conditional forward per
+        # step: the checkpoint is guidance-distilled, so there is no negative branch and guidance_scale /
+        # negative_prompt have no effect, as upstream. FastH3 students keep their own contract above.
+        self.is_base = is_base_checkpoint(self.model_path)
+        self._base_shifts: tuple[float, float] | None = None
+        if self.is_base:
+            self.default_steps = int(mc.get("num_inference_steps") or BASE_NUM_INFERENCE_STEPS)
         self.text_layer = text_encoder_layer(self.model_path)
         self.vae_mode = mc.get("vae", os.environ.get("MINIMAX_H3_VAE", "device"))  # device | cpu
         self.is_output_rank = self.transformer.tp_rank == 0 and self.transformer.cp_rank == 0
@@ -360,6 +373,7 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
         generator: torch.Generator | None = None,
         return_latents: bool = False,
         prompt_embeds: torch.Tensor | None = None,
+        sigmas: tuple[list[float], list[float]] | None = None,
     ) -> dict:
         t0 = time.time()
         if prompt_embeds is not None:
@@ -374,10 +388,10 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
         video_rows, audio_rows = draw_noise(layout, generator)
         positions = (
             step_positions(self.model_path, num_inference_steps)
-            if self.schedule == "contract"
+            if self.schedule == "contract" and sigmas is None
             else None
         )
-        sched_v, sched_a = load_schedulers(self.model_path, num_inference_steps, positions)
+        sched_v, sched_a = load_schedulers(self.model_path, num_inference_steps, positions, sigmas)
         cos, sin = layout.rotary(self.cfg.rope_freq_dim, self.cfg.rope_theta)
         p = self.cfg.patch_size
         grid = (
@@ -398,9 +412,26 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
         shard_d = None if shard is None else tuple(t.contiguous().to(dev) for t in shard)
         fwd_s = []
         vel_dump = []  # per-step velocities (MINIMAX_H3_DUMP_LATENTS): the single-step parity tier
+        # Step replay (MINIMAX_H3_CAPTURE=<path>, MINIMAX_H3_CAPTURE_STEPS=0,25,49): the exact host inputs of the
+        # chosen forwards and the device's velocities, for a CPU single-forward comparison at full size.
+        capture_path = os.environ.get("MINIMAX_H3_CAPTURE") if self.is_output_rank else None
+        capture_steps = {
+            int(s) for s in os.environ.get("MINIMAX_H3_CAPTURE_STEPS", "0").split(",") if s.strip()
+        }
+        captured = []
         for i in range(len(sched_v.timesteps)):
             tv, ta = float(sched_v.timesteps[i]), float(sched_a.timesteps[i])
             ts = torch.tensor([tv, ta], dtype=torch.float32)
+            if capture_path and i in capture_steps:
+                captured.append(
+                    {
+                        "step": i,
+                        "t_video": tv,
+                        "t_audio": ta,
+                        "video_rows": video_rows.clone(),
+                        "audio_rows": audio_rows.clone(),
+                    }
+                )
             tables = None
             if self.host_adaln is not None:
                 tables = self.host_adaln.tables(self.transformer.temb(ts)).contiguous().to(dev)
@@ -417,6 +448,8 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
             )
             vel_v, vel_a = vel_v.to("cpu").float()[0], vel_a.to("cpu").float()[0]
             fwd_s.append(time.time() - t1)
+            if captured and captured[-1]["step"] == i:
+                captured[-1].update(vel_video=vel_v.clone(), vel_audio=vel_a.clone())
             if os.environ.get("MINIMAX_H3_DUMP_LATENTS") and self.is_output_rank:
                 vel_dump.append(
                     {
@@ -444,6 +477,22 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
             if self.is_output_rank:
                 logger.info("MiniMax-H3 rank agreement: %s", self.stats["rank_agreement"])
         out = {"layout": layout, "video_rows": video_rows, "audio_rows": audio_rows}
+        if captured:
+            torch.save(
+                {
+                    "prompt": prompt,
+                    "geom": (height, width, num_frames),
+                    "seed": seed,
+                    "prompt_embeds": embeds,
+                    "sigmas_video": sched_v.sigmas.tolist(),
+                    "sigmas_audio": sched_a.sigmas.tolist(),
+                    "steps": captured,
+                    "final_video_rows": video_rows,
+                    "final_audio_rows": audio_rows,
+                },
+                capture_path,
+            )
+            os.environ.pop("MINIMAX_H3_CAPTURE", None)  # one request per capture
         dump = os.environ.get("MINIMAX_H3_DUMP_LATENTS")
         if dump and "%d" in dump:  # one file per request
             self._requests = getattr(self, "_requests", 0) + 1
@@ -743,6 +792,25 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
         """-> video ``(1, 3, F, H, W)`` in ``[0, 1]`` and stereo audio ``(1, 2, samples)`` at 32 kHz."""
         return self.decode_video(video_rows, layout), self.decode_audio(audio_rows, layout)
 
+    def _base_request_sigmas(self, steps: int, extra: dict) -> tuple[list[float], list[float]]:
+        """(video, audio) sigma boundaries of a base MiniMax-H3 request: ``steps`` denoiser evaluations, shifts
+        from ``extra_args.flow_shift`` / ``extra_args.audio_flow_shift`` or the checkpoint's schedulers (12 / 3).
+        Tasks other than t2va (FL2VA, Ref2VA) are rejected: not supported yet on Neuron."""
+        task = str(extra.get("task", "t2va")).lower()
+        if task not in BASE_TASKS:
+            raise ValueError(
+                f"MiniMax-H3 task {task!r} is not supported on Neuron yet (supported: {', '.join(BASE_TASKS)})"
+            )
+        if self._base_shifts is None:
+            shifts = []
+            for sub in ("scheduler", "audio_scheduler"):
+                with open(os.path.join(self.model_path, sub, "scheduler_config.json")) as f:
+                    shifts.append(float(json.load(f)["shift"]))
+            self._base_shifts = tuple(shifts)
+        video_shift = float(extra.get("flow_shift", self._base_shifts[0]))
+        audio_shift = float(extra.get("audio_flow_shift", self._base_shifts[1]))
+        return base_sigmas(steps, video_shift), base_sigmas(steps, audio_shift)
+
     def forward(self, req, **kwargs):
         from vllm_omni.diffusion.data import DiffusionOutput
 
@@ -768,6 +836,10 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
         if gen is not None and gen.device.type != "cpu":
             gen = None
         extra = getattr(sp, "extra_args", None) or {}
+        sigmas = None
+        if self.is_base:
+            sigmas = self._base_request_sigmas(steps, extra)
+            steps = steps + 1  # generate() counts sigma grid points
         embeds = None
         if extra.get(
             "prompt_embeds_file"
@@ -789,6 +861,7 @@ class NeuronMiniMaxH3Pipeline(nn.Module):
                 seed=sp.seed,
                 generator=gen,
                 prompt_embeds=embeds,
+                sigmas=sigmas,
             )
         finally:
             if handoff:

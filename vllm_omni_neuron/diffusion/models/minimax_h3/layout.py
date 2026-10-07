@@ -187,17 +187,25 @@ def unpack_audio(rows: torch.Tensor, layout: H3Layout) -> torch.Tensor:
 
 
 def load_schedulers(
-    model_path: str, num_inference_steps: int, positions: tuple[float, ...] | None = None
+    model_path: str,
+    num_inference_steps: int,
+    positions: tuple[float, ...] | None = None,
+    sigmas: tuple[list[float], list[float]] | None = None,
 ) -> tuple[MiniMaxH3Scheduler, MiniMaxH3Scheduler]:
     """The video and audio schedulers (shifts from the checkpoint: 12 / 3 for the base and FastH3 4-step, 10 / 3 for
     8-Step-V2). ``num_inference_steps`` counts sigma grid points with the terminal 0 (FastH3 4-step: 5).
 
     ``positions``: an explicit pre-shift rung ladder ending in 0.0 (a distilled checkpoint's trained ladder,
     e.g. 0.999, 0.874, ..., 0.125, 0.0); each scheduler applies its own shift to it. None = the scheduler's linspace.
+    ``sigmas``: fully formed (video, audio) sigma boundaries ending in 0.0, used verbatim (the base request
+    contract, ``config.base_sigmas``); overrides the other two.
     """
     video = MiniMaxH3Scheduler.from_pretrained(model_path, subfolder="scheduler")
     audio = MiniMaxH3Scheduler.from_pretrained(model_path, subfolder="audio_scheduler")
-    if positions is not None:
+    if sigmas is not None:
+        video.set_timesteps(sigmas=sigmas[0])
+        audio.set_timesteps(sigmas=sigmas[1])
+    elif positions is not None:
         base = torch.tensor(positions, dtype=torch.float32)
         for sch in (video, audio):
             sft = sch.shift
