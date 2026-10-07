@@ -62,11 +62,14 @@ sudo docker exec -it \
     --init-timeout 3600
 ```
 
-For 720P serving, replace `--stage-configs-path` with
-`/workspace/plugin/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml`
-([720P stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml))
-and request `width=1280` and `height=720`. This config enables VAE tiling and
-32-way VAE patch parallelism; the 480P examples below use `wan22_stage.yaml`.
+For 720P serving on Trn2, replace `--stage-configs-path` with
+`/workspace/plugin/examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml`
+(TP8 × CP4 × CFG2 on 64 cores) and request `width=1280` and `height=720`. This config
+enables VAE tiling and 32-way VAE patch parallelism; the 480P examples below use
+`wan22_stage.yaml`. The TP4 × CP8 × CFG2
+[720P stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml)
+does not fit Trn2 HBM with the current CP self-attention default and is not supported on Trn2; see the
+[T2V-A14B model card](../models/wan22-t2v-14b.md#recommended-configuration).
 
 For manual installation, run `vllm serve` directly in the activated environment.
 Set the Docker `-e` variables with shell `export` commands, omit the Docker wrapper,

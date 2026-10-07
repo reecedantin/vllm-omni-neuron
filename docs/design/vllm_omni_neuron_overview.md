@@ -220,7 +220,7 @@ The Wan2.2 pipeline has three components, each re-implemented for Neuron.
 built from raw `nn.Parameter` tensors with weight loaders (the vLLM-Neuron LLaMA3 pattern),
 importing pure-math helpers (rotary/time/text/image embeddings) from vLLM-Omni. Key pieces:
 `DistributedRMSNorm` (global RMS across the TP group via all-reduce), `WanFeedForward` (NKI MLP
-kernel + all-reduce), `WanSelfAttention` (fused QKV, then ring or all-gather attention), and
+kernel + all-reduce), `WanSelfAttention` (fused QKV, then all-gather or opt-in ring attention), and
 `WanCrossAttention` (text + optional image). `load_weights()` uses
 `SafetensorsCheckpoint.load_sharded_pipelined` with an explicit param → checkpoint-key mapping
 and a three-stage load pipeline (page-cache prefetch, rank-shard read, host-to-device transfer).
@@ -278,7 +278,7 @@ omni.generate({"prompt": ...}, OmniDiffusionSamplingParams(...))
                  │       ├─ predict_noise(branch)          # DiT NEFF (compiled)
                  │       │   └─ WanTransformer3DModel.forward()
                  │       │       ├─ CP: slice sequence per rank
-                 │       │       ├─ blocks: self-attn (ring|all-gather) + cross-attn + FFN
+                 │       │       ├─ blocks: self-attn (all-gather|ring) + cross-attn + FFN
                  │       │       └─ CP: all-gather full sequence
                  │       └─ _cfg_gather_combine()          # compiled all-gather + combine
                  ├─ (Trn2) offload DiT → CPU on VAE rank
@@ -301,14 +301,15 @@ column-parallel, row-parallel, fused-QKV, and a scaled-bias pattern (each rank a
 `WanTransformer3DModel.forward` splits the patch sequence across CP ranks before the blocks and
 all-gathers the full sequence after. Self-attention has two paths:
 
-- *Default — ring attention:* K/V stay local and the NKI `ring_attention_const_max_fwd` kernel
-  (vendored in `vllm_omni_neuron/kernels/nkilib/`) drives its own `collective_permute` ring
-  across the CP group, merging partial results with a per-query-row constant-max softmax bound.
-- *Capability fallback — all-gather:* each rank all-gathers K/V across the CP group to the full
-  sequence, then runs local flash attention (the "Naive AllGather CP" in
-  [Context Parallelism in vLLM Omni Neuron](context_parallelism.md)). Taken automatically, and only, where the
-  ring kernel cannot run (CPU mode, fake-tensor tracing, NKI disabled) — a capability check, not
-  a setting.
+- *Default — all-gather:* each rank all-gathers K/V across the CP group to the full
+  sequence, then runs local flash attention with the true row maximum and an FP32 softmax (the
+  "Full K/V AllGather" path in [Context Parallelism in vLLM Omni Neuron](context_parallelism.md)).
+- *Opt-in — ring attention* (`WAN22_CP_RING_ATTENTION=1`): K/V stay local and the NKI
+  `ring_attention_const_max_fwd` kernel (vendored in `vllm_omni_neuron/kernels/nkilib/`) drives
+  its own `collective_permute` ring across the CP group, merging partial results with a
+  per-query-row constant-max softmax bound. That bound can zero whole attention rows at the late
+  denoising steps, so it is not the default; it never runs for a padded sequence, in CPU mode,
+  under fake-tensor tracing, or with NKI disabled.
 
 **CFG parallelism.** `NeuronCFGParallelMixin` overrides `predict_noise_maybe_with_cfg`.
 Classifier-free guidance normally runs the model twice per step (a conditional "positive" and an

@@ -78,7 +78,7 @@ steps. Override the output shape with `--height`, `--width`, and
 
 ```bash
 sudo docker exec vllm-omni-neuron python /workspace/plugin/examples/wan22/run.py \
-  --stage-config /workspace/plugin/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml \
+  --stage-config /workspace/plugin/examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml \
   --height 720 \
   --width 1280 \
   --num-frames 81 \
@@ -94,8 +94,11 @@ the [feature and configuration guide](../guides/features-guide.md#generation-con
 for the complete control and trade-off table.
 
 The run uses `/workspace/plugin/examples/wan22/wan22_stage.yaml` by default and
-the [720P stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml)
-for the 720P command above. For parallelism, 720P, and
+`/workspace/plugin/examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml` (TP8 × CP4 × CFG2 on 64 cores)
+for the 720P command above. The TP4 × CP8 × CFG2
+[720P stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml)
+does not fit Trn2 HBM with the current CP self-attention default and is not supported on Trn2; see the
+[T2V-A14B model card](../models/wan22-t2v-14b.md#recommended-configuration). For parallelism, 720P, and
 quality tuning, see
 [Optimizing offline video generation](../model-dev/optimizing-offline-video-generation.md).
 

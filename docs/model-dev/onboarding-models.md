@@ -89,15 +89,15 @@ reach for these rather than reimplementing:
 | Tensor parallelism | `parallel_config` | `tensor_parallel_size` (1b) |
 | CFG parallelism | Mix in, ahead of the upstream pipeline | `NeuronCFGParallelMixin` (1a) |
 | Context / sequence parallelism | `parallel_config` + `model_config` | `ring_degree`, `tp_sequence_parallel` (1b) |
-| Ring attention for CP self-attention | `model_config`, **on by default** | `enable_ring_attention` (Step 5) |
+| Ring attention for CP self-attention | Environment variable, **off by default** | `WAN22_CP_RING_ATTENTION=1` (Step 5) |
 | Row-MX FP8 quantization | `model_config` | `quantization: fp8_row_mx`, `modules_to_not_convert` |
 | VAE spatial tiling | `engine_args` | `vae_use_tiling: true` |
 | VAE patch parallelism | Mix in + `parallel_config` | `DistributedVaeMixin`, `vae_patch_parallel_size` (1c) |
 | Attention backend | Platform default, no code | `NeuronSDPABackend` (1e) |
 
-If your model needs a custom NKI kernel, wire it in behind the same shape as ring attention: a
-`model_config` field that selects the kernel and falls back to a torch path when the kernel
-cannot run, so CPU mode and fake-tensor tracing keep working.
+If your model needs a custom NKI kernel, wire it in behind a switch that falls back to a torch
+or library path when the kernel cannot run, so CPU mode and fake-tensor tracing keep working,
+and gate the kernel at the late denoising steps before making it a default.
 
 Subsections 1a–1f walk the Wan2.2 text-to-video reference component by component. Attention
 (1e) and the scheduler (1f) are usually *reused*, not written.
@@ -360,13 +360,13 @@ tracing checks and for the CPU-only unit tests under `test/unit/`.
   [Optimizing high-quality offline video generation](./optimizing-offline-video-generation.md).
 - **VAE tiling** — set `vae_use_tiling: true` (or VAE patch parallelism) for large
   resolutions that would otherwise OOM at decode.
-- **Ring attention** — the CP self-attention path is selected by the stage config's
-  `model_config.enable_ring_attention`, not an environment variable. It is a tri-state and
-  **ring is the default**: omit it to run the ring NKI kernel, falling back to all-gather K/V
-  + flash only where the kernel cannot run (CPU mode, fake-tensor tracing); set `false` to
-  always take all-gather + flash; set `true` to require ring and raise instead of falling
-  back. See the commented block in
-  [`wan22_stage.yaml`](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage.yaml).
+- **Ring attention** — Wan2.2 CP self-attention all-gathers K/V and runs flash attention with
+  the true row maximum by default. The const-max ring NKI kernel is opt-in with the environment
+  variable `WAN22_CP_RING_ATTENTION=1`: its static softmax bound zeroes attention rows at the
+  late, low-noise denoising steps (see the
+  [context parallelism design doc](../design/context_parallelism.md#ring-attention-opt-in)), so
+  measure accuracy at the last steps before enabling it. It never runs for a padded sequence, in
+  CPU mode, or under fake-tensor tracing.
 
 ### Step 6 — Wire up CI and docs
 

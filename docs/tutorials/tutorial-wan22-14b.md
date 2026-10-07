@@ -88,7 +88,8 @@ parallel_config:
 
 - **`ring_degree`** (not `sequence_parallel_size`) sets the context-parallel degree; vLLM
   Omni derives `sequence_parallel_size = ulysses_degree(1) * ring_degree`. CP self-attention
-  runs ring attention. See the [context parallelism design doc](../design/context_parallelism.md).
+  all-gathers K/V and runs flash attention with the true row maximum; the ring-attention kernel
+  is opt-in (`WAN22_CP_RING_ATTENTION=1`). See the [context parallelism design doc](../design/context_parallelism.md).
 - **`boundary_ratio`** should be `0.9` for I2V and `0.875` for T2V — the I2V stage config
   already sets this. A wrong value switches MoE experts at the wrong step.
 
@@ -111,11 +112,12 @@ sudo docker exec vllm-omni-neuron python /workspace/plugin/examples/wan22/run.py
   --output 480P.mp4
 ```
 
-720P generation (1280x720) uses the [720P stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml), with VAE tiling and 32-way VAE patch parallelism:
+720P generation (1280x720) on Trn2 uses `examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml` (TP8 × CP4 × CFG2 on 64 cores), with VAE tiling and 32-way VAE patch parallelism. The TP4 × CP8 × CFG2 [720P stage config](https://github.com/aws-neuron/vllm-omni-neuron/blob/release-0.24.0.0.1.0/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml) does not fit Trn2 HBM with the current CP self-attention default (see the [T2V-A14B model card](../models/wan22-t2v-14b.md#recommended-configuration)):
 
 ```bash
 sudo docker exec vllm-omni-neuron python /workspace/plugin/examples/wan22/run.py \
-  --stage-config /workspace/plugin/examples/wan22/wan22_stage_tp4cp8cfg2_720p.yaml \
+  --stage-config /workspace/plugin/examples/wan2_2/wan22_stage_tp8cp4cfg2_720p.yaml \
+  --tensor-parallel-size 8 \
   --num-frames 81 --height 720 --width 1280 --guidance-scale 5.0 \
   --prompt "A fluffy orange cat walking gracefully across a sunny garden path, high quality, detailed" \
   --output 720P.mp4

@@ -2,15 +2,15 @@
 
 <!-- meta: description: How context parallelism (CP) works in vLLM Omni Neuron —
 sequence sharding on top of vLLM Omni's sequence-parallelism groups, the
-ring-attention CP path used by default for the Wan2.2 DiT (with a Full K/V
-AllGather fallback), how CP composes with tensor parallelism, the sequence-length
+Full K/V AllGather CP path used by default for the Wan2.2 DiT (with an opt-in
+ring-attention kernel), how CP composes with tensor parallelism, the sequence-length
 divisibility constraints, and the known kernel limitations. -->
 <!-- meta: keywords: vLLM, Neuron, context parallelism, CP, sequence parallelism,
 sequence sharding, ring attention, collective_permute, AllGather,
 DeepSpeed-Ulysses, self-attention, rotary embeddings, tensor parallelism, NKI
 kernels, Wan2.2, DiT, Trainium -->
 <!-- meta: content_type: design-doc -->
-<!-- meta: date_updated: 2026-08-26 -->
+<!-- meta: date_updated: 2026-10-06 -->
 
 ## Overview
 
@@ -18,7 +18,7 @@ Context Parallelism (CP) in vLLM Omni Neuron enables efficient processing of lon
 
 Unlike traditional tensor parallelism that shards model parameters, context parallelism shards the sequence dimension, allowing each rank to process a subset of tokens while still computing attention over the full sequence. The communication strategy for attention can vary — ring attention (K/V chunks passed between ranks in a ring, so no rank materializes the full K/V), Full K/V AllGather (K/V gathered before attention so each rank computes local Q × full K/V), or DeepSpeed-Ulysses (All-to-All redistribution from sequence-partitioned to head-partitioned).
 
-The current implementation uses **ring-attention CP** via a vendored ring-attention NKI kernel, which drives its own `collective_permute` around the CP group and keeps K/V memory at `1/cp_size`. It **falls back to Full K/V AllGather** only where the ring kernel cannot run (CPU mode, fake-tensor tracing, NKI disabled).
+The current implementation uses **Full K/V AllGather** by default: each rank gathers the CP group's K/V and runs flash attention with the true row maximum and an FP32 softmax. A vendored const-max **ring-attention** NKI kernel, which drives its own `collective_permute` around the CP group and keeps K/V memory at `1/cp_size`, is opt-in (`WAN22_CP_RING_ATTENTION=1`): its static softmax bound can zero whole attention rows (see [Ring attention (opt-in)](#ring-attention-opt-in)).
 
 ## Architecture
 
@@ -92,13 +92,15 @@ if self.cp_size > 1:
 
 The `WanSelfAttention` module projects and RoPEs its local Q/K/V shard, then hands the CP policy to the shared `wan_cp_self_attention` core.
 
-#### Ring attention (current implementation)
+#### Ring attention (opt-in)
 
 K/V stay sharded (`local_S` tokens per rank). The ring-attention NKI kernel drives a `collective_permute` around the CP group, streaming each rank's K/V chunk through every other rank so local Q attends the full sequence without ever materializing full K/V. Q remains sequence-partitioned — no output redistribution is needed.
 
-#### Full K/V AllGather (fallback)
+The kernel shifts each softmax row by a Cauchy-Schwarz bound (`scale * |q_i| * max_j |k_j|`) instead of the row's true maximum. When the bound exceeds the row maximum by more than about 85 (in exponent units), every probability of the row underflows and the kernel returns an all-zero row, with no error. In the Wan2.2 DiT this happens at the late, low-noise denoising steps (Wan2.2-TI2V-5B, step 49 of 50 at 1280x704x121: about 34,000 zeroed query rows, positive-branch prediction 5.7% from CPU FP32 against 2.1% with the true maximum). Enable it with `WAN22_CP_RING_ATTENTION=1` only where that accuracy loss has been measured and accepted; it never runs when the sequence was padded, in CPU mode, under fake-tensor tracing, or with NKI disabled.
 
-Where the ring kernel cannot run (CPU mode, fake-tensor tracing, NKI disabled), each rank AllGathers K/V from all CP ranks to materialize the full sequence, then computes local Q × full K/V attention:
+#### Full K/V AllGather (default)
+
+Each rank AllGathers K/V from all CP ranks to materialize the full sequence, then computes local Q × full K/V attention:
 
 ```python
 class WanSelfAttention(nn.Module):
@@ -153,7 +155,7 @@ class WanSelfAttention(nn.Module):
 
 #### Comparison with Other CP Strategies
 
-| Aspect | Ring Attention (current) | Full K/V AllGather (fallback) | DeepSpeed-Ulysses |
+| Aspect | Ring Attention (opt-in) | Full K/V AllGather (default) | DeepSpeed-Ulysses |
 |--------|--------------------------|-------------------------------|-------------------|
 | Communication primitive | `collective_permute` in ring | AllGather on K/V | All-to-All on Q,K,V + All-to-All on output |
 | Rounds per layer | cp_size send/recv | 1 AllGather | 2 All-to-All |
@@ -161,7 +163,7 @@ class WanSelfAttention(nn.Module):
 | Head constraint from CP | None | None | `num_heads % cp_size == 0` |
 | Compute-comm overlap | Overlaps attention with P2P | None | None |
 
-Ring attention minimizes peak K/V memory (its main draw for long sequences) at the cost of `cp_size` communication rounds; Full K/V AllGather is a single collective with no head-count constraints, kept as the always-correct fallback; DeepSpeed-Ulysses is more memory-efficient than AllGather at large CP degrees but adds head-count constraints and is not used here.
+Ring attention minimizes peak K/V memory (its main draw for long sequences) at the cost of `cp_size` communication rounds, and the const-max kernel used here trades exactness for that (see above); Full K/V AllGather is a single collective with no head-count constraints and an exact softmax, so it is the default; DeepSpeed-Ulysses is more memory-efficient than AllGather at large CP degrees but adds head-count constraints and is not used here.
 
 ## Communication Pattern
 
@@ -171,7 +173,7 @@ Ring attention minimizes peak K/V memory (its main draw for long sequences) at t
 2. **Sequence Sharding**: Split tokens across CP ranks
 3. **Transformer Blocks**:
    - Each rank processes its local token subset
-   - Self-attention: ring `collective_permute` of local K/V shards → local Q attends full sequence (Full K/V AllGather only on the fallback path)
+   - Self-attention: AllGather of K/V across the CP group → local Q attends the full sequence (ring `collective_permute` of local K/V shards only when the opt-in ring kernel is enabled)
    - Cross-attention uses full encoder states (no sharding)
    - FFN operates on local tokens
 4. **Sequence Gathering**: Reconstruct full sequence
@@ -212,7 +214,7 @@ Note that despite the name, `ring_degree` only sizes the sequence-parallel group
 
 - **Sequence Length**: Linear memory reduction with CP degree
 - **Model Size**: Orthogonal to tensor parallelism scaling
-- **Communication**: Ring `collective_permute` moves one K/V shard (`1/cp_size` of the sequence) per round over `cp_size` rounds, overlapped with attention compute; the AllGather fallback instead materializes full K/V on every rank
+- **Communication**: the default AllGather materializes full K/V on every rank with one collective per layer; the opt-in ring `collective_permute` instead moves one K/V shard (`1/cp_size` of the sequence) per round over `cp_size` rounds, overlapped with attention compute
 
 ### Optimal Use Cases
 
@@ -317,7 +319,7 @@ omni_ps._SP = omni_ps.init_model_parallel_group(
 
 ## Related information
 
-- [Kernel reference: `ring_attention_const_max_fwd`](../model-dev/kernels/ring-attention-const-max.md) — the design of the ring-attention kernel this page configures: why its softmax max is a runtime bound, and how that lets the K/V rotation overlap attention compute.
+- [Kernel reference: `ring_attention_const_max_fwd`](../model-dev/kernels/ring-attention-const-max.md) — the design of the opt-in ring-attention kernel: why its softmax max is a runtime bound, and how that lets the K/V rotation overlap attention compute.
 - [Kernel implementations](../model-dev/kernels/index.md) — other per-kernel design references.
 - [Design: Engine, Worker, and Model Integration](vllm_omni_neuron_overview.md) — where CP sits in the runtime.
 - [Features guide](../guides/features-guide.md) — the user-facing parallelism configuration.
