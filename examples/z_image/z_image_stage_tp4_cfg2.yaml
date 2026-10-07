@@ -1,0 +1,25 @@
+# Fastest Z-Image (base) layout: TP4 x CFG2 on an adjacent Trn2 chip pair (8 logical cores). Heads are
+# zero-padded from 30 to 32 so TP4 divides them.
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7"  # TP4 x CFG2: eight logical cores, two adjacent chips
+      max_batch_size: 1
+    engine_args:
+      model_class_name: ZImagePipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      engine_backend: vllm_omni_neuron.diffusion.models.z_image.pipeline_z_image.ZImageDiffusionEngine
+      model_config:
+        block_split: 5          # main-block graph size for BlockGraphRunner (30 layers / 5 = 6 chunks)
+        text_encoder_on_host: false # on the NeuronCores (TP), fp32 residual + norms; true = CPU bf16
+        vae_tile_lat: 64        # host-tiled VAE decode, tile size in latent px (0 = whole-latent graph)
+        dummy_run_height: 1024  # match served res -- see ZImageDiffusionEngine docstring
+        dummy_run_width: 1024
+      parallel_config:
+        tensor_parallel_size: 4 # 30 heads zero-padded to 32 (8 per core)
+        cfg_parallel_size: 2    # one guidance branch per TP group, at once (Z-Image base; Turbo has no CFG)
