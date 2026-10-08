@@ -58,13 +58,35 @@ For the 8-step student, pass `--model-path FastVideo/FastVideo-FastH3-8-Step-V2 
 layouts its sparse-attention graph compiles at). Its sparse attention and scheduler shifts are read from the
 checkpoint.
 
+### Base MiniMax-H3 (50 steps)
+
+Point `--model-path` at the MiniMax-H3 checkpoint root (`MODEL_ROOT`, the Diffusers layout with `transformer/`,
+`vae/`, `audio_vae/` and `text_encoder/`) and use the base stage config. This is the upstream T2VA request (prompt,
+seed, 50 steps, shifts 12 / 3) at 124 frames:
+
+```bash
+python examples/minimax_h3/run.py \
+  --model-path "${MODEL_ROOT}" \
+  --stage-config examples/minimax_h3/minimax_h3_base_stage.yaml \
+  --prompt "In a snowy blue-purple forest, Ori carefully walks past a sleeping giant; footsteps crunch in the snow while the creature breathes and softly snorts." \
+  --height 768 --width 1344 --num-frames 124 --seed 1101 \
+  --output minimax_h3_768.mp4
+```
+
+On a trn2.48xlarge this writes a 5.17 s H.264 clip with a 32 kHz stereo soundtrack. The first request in a new
+process with the graphs already in the compile cache took 320 s (stage init 69 s before it); on an empty cache the
+DiT graph compiles too, and a later warm request takes about 69 s (the model card's Performance section).
+
+For the base checkpoint `--steps` counts denoiser evaluations (default 50), and `--flow-shift` / `--audio-flow-shift`
+override the video / audio sigma shifts (default 12 / 3).
+
 ### Change the output shape and sampling controls
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--height`, `--width` | 384, 640 | Canvas; multiples of 32 |
 | `--num-frames` | 124 | Rounded up to `17n + 5` (the video VAE's chunking) |
-| `--steps` | the checkpoint's | Sigma-grid points: 5 for 4-step, 9 for 8-Step-V2 |
+| `--steps` | the checkpoint's | FastH3: sigma-grid points (5 for 4-step, 9 for 8-Step-V2); base MiniMax-H3: denoiser evaluations (50) |
 | `--seed` | 0 | Noise seed (drawn on the host in fp32) |
 | `--prompt-embeds` | none | `.pt` with `prompt_embeds`; skips the text encoder |
 | `--tp` | 8 | Tensor-parallel degree; must divide 56 heads and the FFN width |

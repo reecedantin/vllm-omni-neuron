@@ -7,7 +7,7 @@ TP=8 x CP=8 trn2 configuration on 64 cores, accuracy against a CPU fp32 referenc
 diffusion, DMD2, video sparse attention, VSA, vLLM, vLLM Omni, Neuron, Trainium2, trn2, BF16, tensor parallelism,
 context parallelism, VAE tile parallelism -->
 <!-- meta: content_type: model-card -->
-<!-- meta: date_updated: 2026-10-06 -->
+<!-- meta: date_updated: 2026-10-08 -->
 
 ## Introduction
 
@@ -26,7 +26,9 @@ MiniMax-H3 that generate a clip in a few transformer forwards with guidance dist
   and a learned compression gate. Its sparse attention is part of the model, not an optional speed-up.
 
 Both are supported for text-to-video-and-audio (t2va) inference serving with
-[vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) using the Neuron SDK on AWS Trainium2 (`trn2`).
+[vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) using the Neuron SDK on AWS Trainium2 (`trn2`), and so
+is the base MiniMax-H3 itself (50 denoising steps, t2va). The base checkpoint is guidance-distilled too: every step is
+one conditional transformer forward, with no unconditional (negative-prompt) branch.
 
 **License:** [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE), which
 applies to the FastH3 students too. Read it before use: it restricts the territories and uses it covers.
@@ -37,6 +39,7 @@ applies to the FastH3 students too. Read it before use: it restricts the territo
 |-------|-------------|----------|--------------|
 | FastH3 4-step (dense) | [FastVideo/FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree) | Trn2 | BF16 |
 | FastH3 8-Step-V2 (VSA) | [FastVideo/FastVideo-FastH3-8-Step-V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2) | Trn2 | BF16 |
+| MiniMax-H3 base, 50 steps (t2va) | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (checkpoint root, Diffusers layout) | Trn2 | BF16 |
 
 ## Features
 
@@ -44,7 +47,8 @@ applies to the FastH3 students too. Read it before use: it restricts the territo
 |---|---|---|
 | **Generation** | Text-to-video-and-audio (t2va), stereo 32 kHz soundtrack | ✅ |
 | | 256x256, 384x640, 704x1280 and 1344x768, 124 frames (5.17 s at 24 fps) | ✅ |
-| | First/last-frame (FL2VA), reference (Ref2VA), base 50-step MiniMax-H3 | - |
+| | Base MiniMax-H3, 50 steps, t2va at 1344x768x124 | ✅ |
+| | First/last-frame (FL2VA), reference (Ref2VA), LightX2V Turbo LoRAs | - |
 | **Attention** | Dense (NKI `attention_cte` on NeuronCore-v3) | ✅ |
 | | VSA-H3 sparse attention (8-Step-V2) | ✅ |
 | **Quantization** | BF16 | ✅ |
@@ -102,6 +106,28 @@ The checkpoint's `fastvideo_inference.json` selects the sampling contract automa
 - video and audio scheduler shifts (12/3 for 4-step, 10/3 for 8-Step-V2);
 - VSA sparsity, if the checkpoint uses it.
 
+### Base MiniMax-H3 (50 steps)
+
+Point `--model-path` at the MiniMax-H3 checkpoint root (the Diffusers layout: `transformer/`, `vae/`, `audio_vae/`,
+`text_encoder/`, schedulers) and use
+[`examples/minimax_h3/minimax_h3_base_stage.yaml`](../../examples/minimax_h3/minimax_h3_base_stage.yaml): the same
+TP=8 × CP=8 layout on 64 cores as above. A checkpoint without `fastvideo_inference.json` is served with the request
+contract of vLLM-Omni v0.30.0's MiniMax-H3 pipeline (`vllm_omni/diffusion/models/minimax_h3/`, `time_request.py`,
+`pipeline_minimax_h3.py`; recipe `MiniMax-H3.md`, "Key parameters" and the T2VA request):
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `num_inference_steps` | 50 | Counts denoiser evaluations. The sigma boundaries are `linspace(1, 0, N + 1)` through the exponential shift `s·x / (1 + (s - 1)·x)` |
+| `extra_args.flow_shift` | 12 | Video sigma shift (the checkpoint's `scheduler`) |
+| `extra_args.audio_flow_shift` | 3 | Audio sigma shift (the checkpoint's `audio_scheduler`) |
+| `guidance_scale`, `negative_prompt` | unused | Guidance-distilled: one conditional forward per step, no negative branch (upstream rejects `cfg_parallel_size > 1` for the same reason) |
+| `extra_args.task` | `t2va` | `fl2va` and `ref2va` are rejected (not supported yet) |
+| `fps` | 24 | |
+
+The update is the rectified-flow Euler step with eta = 0 (`x0 = x_t + sigma·v`, then
+`x_next = r·x_t + (1 - r)·x0` with `r = sigma_next / sigma`). Only `transformer/` is loaded: `transformer_ref/` is the
+Ref2VA transformer, which t2va does not use. The FastH3 contract above is unchanged: for those checkpoints
+`num_inference_steps` still counts sigma grid points (5 = 4 forwards).
 ## Accuracy Evaluation
 
 **Full-size gate at the recommended configuration** (FastH3 4-step, 1344x768x124, seed 0, fixed prompt
@@ -128,6 +154,39 @@ At 768p the device run sits on the bf16 floor on every metric: bf16 rounding mov
 different, equally plausible clip (same scene and motion), and the device does it by the same amount as CPU bf16.
 The decoded clip and the 704x1280 clip from the prompt text were checked by eye: a golden retriever running
 through surf, no tile seams, flicker or colour shifts. Job 1005-142737 (device), CPU references on the host.
+
+**Base MiniMax-H3, 50 steps, at the recommended configuration** (1344x768x124, TP=8 × CP=8 on 64 cores, the upstream
+T2VA request: its prompt through the device text encoder, seed 1101, shifts 12 / 3). A 50-step end-to-end CPU
+reference at this size (about 50 × 15-25 minutes per precision) was not run. Instead, the device run recorded the
+exact inputs of three of its forwards (`MINIMAX_H3_CAPTURE`): the latents fed to the DiT, the timesteps and the prompt
+embeddings, and its velocities. Diffusers' `MiniMaxH3Transformer3DModel` then ran each of those forwards on the host
+CPU in fp32 (the reference) and in bf16 (the floor). Same bar: **device error ≤ 2 × the CPU-bf16 error + 0.5%**.
+
+| Step (video / audio sigma) | Modality | Trn2 rel-L2 / cos vs fp32 | CPU bf16 floor | Bar | Result |
+|---|---|---|---|---|---|
+| 0 (1.000 / 1.000) | video | **1.61% / 0.99989** | 1.49% / 0.99990 | ≤ 3.48% | pass |
+| 0 | audio | **1.86% / 0.99983** | 2.63% / 0.99966 | ≤ 5.75% | pass |
+| 25 (0.923 / 0.750) | video | **1.96% / 0.99981** | 1.74% / 0.99985 | ≤ 3.97% | pass |
+| 25 | audio | **2.37% / 0.99972** | 2.25% / 0.99975 | ≤ 5.00% | pass |
+| 49 (0.197 / 0.058) | video | **1.32% / 0.99991** | 1.40% / 0.99990 | ≤ 3.30% | pass |
+| 49 | audio | **2.94% / 0.99957** | 3.14% / 0.99951 | ≤ 6.78% | pass |
+| all 64 ranks hold bit-identical final latents (5 requests in one process) | | yes | - | - | pass |
+| first and last request of the process bit-equal (video and audio) | | yes | - | - | pass |
+
+The device sits on the CPU-bf16 floor at the start, middle and end of the trajectory. The decoded clip was checked frame
+by frame and by eye: no zeroed rows, columns or flat 16x16 blocks in any of the 124 frames; adjacent-frame SSIM 0.850
+mean, 0.798 lowest (a smooth camera move); a snowy blue-purple forest, a sleeping giant and a small figure walking past
+it, as prompted. The waveform is finite, RMS 0.057, peak 0.56, nothing clipped, both channels at the same level. Jobs
+1007-230636 (device) and 1007-233229 (the quickstart, byte-identical mp4), CPU replays on the host. To reproduce:
+
+```bash
+MINIMAX_H3_CAPTURE=cap.pt MINIMAX_H3_CAPTURE_STEPS=0,25,49 MINIMAX_H3_RANK_CHECK=1 python examples/minimax_h3/run.py \
+  --model-path <checkpoint root> --stage-config examples/minimax_h3/minimax_h3_base_stage.yaml \
+  --height 768 --width 1344 --num-frames 124 --seed 1101 --prompt "<prompt>" --output clip.mp4
+python examples/minimax_h3/eval/step_replay.py run --model-path <checkpoint root> --capture cap.pt --dtype fp32 --out f32.pt
+python examples/minimax_h3/eval/step_replay.py run --model-path <checkpoint root> --capture cap.pt --dtype bf16 --out b16.pt
+python examples/minimax_h3/eval/step_replay.py compare --capture cap.pt --fp32 f32.pt --bf16 b16.pt
+```
 
 **Small-canvas gate** (256x256, 124 frames, seed 0, fixed prompt embeddings, same references and bar; also covers
 8-Step-V2). The bar is applied to the
@@ -248,6 +307,25 @@ below the raw-pixel numbers of the gate). The rank check itself adds about 0.3 s
 704x1280 is measured for speed only, not accuracy-checked against a CPU reference at this size. All 64 ranks hold
 bit-identical final latents on every request, and the clip is byte-identical to an earlier run of the same request.
 
+**Base MiniMax-H3, 50 steps** (1344x768x124, TP=8 × CP=8 on 64 cores,
+[`minimax_h3_base_stage.yaml`](../../examples/minimax_h3/minimax_h3_base_stage.yaml), the upstream T2VA request: its
+prompt, seed 1101, shifts 12 / 3, prompt text through the device text encoder (30 tokens), prompt cached; the
+all-rank agreement check was on for every request):
+
+| Stage | Seconds |
+|---|---|
+| DiT, 50 forwards (sequence-parallel TP) | 50 × 1.29 s = 64.4 s |
+| decode stage, wall (video VAE 1.69 s, audio windows overlapped) | 1.71 s |
+| **whole request** (runs: 68.80 / 68.73 / 68.71 s; load average 9.4 / 19.8 / 19.9) | **68.73 s** |
+| first request, new process (one DiT graph compiled for the new prompt length, the rest from the compile cache) | 493 s |
+| stage init (model load, before the first request) | 78 s |
+| HBM per core (peak over the whole run, neuron-monitor) | 17.6 GiB |
+
+The first request's 493 s split: text encoder 183 s (shard load and its bucket graph), first DiT forward 199 s (the
+compile), the other 49 forwards 63 s, decode 45 s (NEFF loads). Host memory: MemAvailable fell by at most 589 GB during
+the job. A DiT forward at this shape takes 1.29 s with the base weights against 1.05 s for FastH3 4-step in the
+table above (same graph shapes); the difference was not investigated.
+
 **First request.** It compiles whatever the compile cache does not already hold, and in every case it loads the
 NEFFs on 64 ranks and builds the device text encoder. 1344x768, same prompt as the table above:
 
@@ -364,7 +442,9 @@ compiling took 287 s for the 4-step checkpoint and 460 s for 8-Step-V2. Later ru
 
 ## Known limitations
 
-- **t2va only.** FL2VA, Ref2VA, the base 50-step MiniMax-H3 and the LightX2V Turbo LoRAs are not wired in yet.
+- **t2va only.** FL2VA, Ref2VA and the LightX2V Turbo LoRAs are not wired in yet.
+- **Base MiniMax-H3 was verified at 1344x768x124 on 64 cores only.** Other sizes and smaller layouts use the same code
+  and graphs as FastH3 but have not been run with the base checkpoint.
 - **8-Step-V2 is slower per forward than dense.** The sparse attention is a masked full-score attention (exact, static
   shapes): 4.18 s per forward versus 1.34 s for dense. An additive tile-bias formulation of the same mask measured
   18.3 s per forward and is not shipped. A gather-based block-sparse kernel would be needed to profit from
