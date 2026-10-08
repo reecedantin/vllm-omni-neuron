@@ -9,8 +9,8 @@ and in bf16 (the floor), then compares:
     python examples/minimax_h3/eval/step_replay.py run --model-path <ckpt> --capture cap.pt --dtype bf16 --out b16.pt
     python examples/minimax_h3/eval/step_replay.py compare --capture cap.pt --fp32 f32.pt --bf16 b16.pt [--out r.json]
 
-Bar per step and modality: device rel-L2 vs fp32 <= 2 x the CPU-bf16 rel-L2 + 0.5%. Run with
-``fleet/bin/cpumode.sh`` sourced.
+Bar per step and modality: device rel-L2 vs fp32 <= 2 x the CPU-bf16 rel-L2 + 0.5%. Run on the host CPU
+(``PJRT_DEVICE=CPU VLLM_NEURON_CPU_MODE=1 VLLM_NEURON_LIBTORCH_NEURONX_LITE=0 NEURON_RT_VISIBLE_CORES=``).
 """
 
 from __future__ import annotations
